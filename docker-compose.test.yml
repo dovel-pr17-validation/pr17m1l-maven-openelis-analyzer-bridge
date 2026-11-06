@@ -1,0 +1,104 @@
+# Cross-process acceptance environment for priority analyzer result traffic.
+# analyzer-mock sends real GeneXpert ASTM traffic and writes a real
+# FluoroCycler file; WireMock captures the normalized OpenELIS request.
+
+services:
+  # OpenELIS Analyzer Bridge (under test)
+  openelis-analyzer-bridge:
+    build: .
+    ports:
+      # Host ports come from the environment so run-all.sh can start an isolated stack next to
+      # anything else on the machine; the defaults are the ports CI has always used.
+      - "${E2E_ASTM_LIS1A_PORT:-12001}:12001"   # ASTM LIS1-A listener
+      - "${E2E_ASTM_E1381_PORT:-12011}:12011"   # ASTM E1381-95 listener
+      - "${E2E_MLLP_PORT:-2575}:2575"           # Shared MLLP listener, bound at boot
+      - "${E2E_BRIDGE_PORT:-8443}:8443"         # HTTP /input endpoint + actuator
+    environment:
+      SPRING_PROFILES_ACTIVE: test
+      LOGGING_LEVEL_ORG_ITECH: DEBUG
+      LOGGING_LEVEL_ROOT: INFO
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-150}
+      # A site zone other than UTC, so analyzer test times prove they are read in the container's zone.
+      TZ: Pacific/Port_Moresby
+    volumes:
+      - ./configuration.test.yml:/app/configuration.yml:ro
+      - analyzer-input:/data/analyzer-imports
+      # A named volume, not tmpfs: the outbox has to survive the container being recreated, which
+      # is the whole point of the recovery scenario.
+      - bridge-state:/data/openelis-analyzer-bridge
+    networks:
+      astm-test-net:
+        ipv4_address: ${E2E_SUBNET_PREFIX:-172.28.0}.100
+      # A second network gives the mock a second real source address, so two analyzers on one
+      # shared listener can be told apart by address.
+      astm-test-net-b:
+        ipv4_address: ${E2E_SUBNET_B_PREFIX:-172.28.1}.100
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      wiremock:
+        condition: service_healthy
+
+  analyzer-mock:
+    build:
+      context: ${ANALYZER_MOCK_CONTEXT:?Set ANALYZER_MOCK_CONTEXT to the analyzer-mock-server checkout}
+    command: ["python", "-u", "server.py", "--api-port", "8080"]
+    environment:
+      ANALYZER_BRIDGE_PROFILES_DIR: /bridge-profiles
+    ports:
+      - "${E2E_MOCK_PORT:-18080}:8080"
+    volumes:
+      - ./src/main/resources/analyzer-profiles:/bridge-profiles:ro
+      - analyzer-input:/data/analyzer-imports
+    networks:
+      astm-test-net:
+        ipv4_address: ${E2E_SUBNET_PREFIX:-172.28.0}.150
+      astm-test-net-b:
+        ipv4_address: ${E2E_SUBNET_B_PREFIX:-172.28.1}.150
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # WireMock — captures forwarded messages for verification
+  # Query API: GET http://localhost:${E2E_WIREMOCK_PORT}/__admin/requests
+  # Reset:     DELETE http://localhost:${E2E_WIREMOCK_PORT}/__admin/requests
+  wiremock:
+    image: wiremock/wiremock:3.3.1
+    ports:
+      - "${E2E_WIREMOCK_PORT:-8080}:8080"
+    command:
+      - --port=8080
+      - --verbose
+      - --global-response-templating
+    volumes:
+      - ./test-data/wiremock:/home/wiremock
+    networks:
+      astm-test-net:
+        ipv4_address: ${E2E_SUBNET_PREFIX:-172.28.0}.200
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/__admin/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+networks:
+  astm-test-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${E2E_SUBNET_PREFIX:-172.28.0}.0/24
+  astm-test-net-b:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${E2E_SUBNET_B_PREFIX:-172.28.1}.0/24
+
+volumes:
+  analyzer-input:
+  bridge-state:

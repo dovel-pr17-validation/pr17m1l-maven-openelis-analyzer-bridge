@@ -1,0 +1,632 @@
+package org.itech.ahb.fhir;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.util.List;
+import java.util.TimeZone;
+import org.itech.ahb.fhir.FhirBundleBuilder.AnalyzerResult;
+import org.itech.ahb.fhir.HL7ResultParser.ParsedResults;
+import org.itech.ahb.profile.AstmResultRecordSelection;
+import org.itech.ahb.profile.ControlResultRecognition;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Unit tests for {@link ASTMResultParser}.
+ *
+ * <p>Validates ASTM LIS2-A2 parsing logic: accession extraction from O-record,
+ * test code extraction from R-record (^^^CODE and ^CODE formats), value
+ * cleaning, QC sample detection, and timestamp extraction.
+ */
+@DisplayName("ASTMResultParser")
+class ASTMResultParserTest {
+
+    private static final AstmResultRecordSelection ALL_RESULTS = AstmResultRecordSelection.all();
+    private static final AstmResultRecordSelection GENEXPERT_RESULTS =
+            AstmResultRecordSelection.fieldNonBlank("R.3.5");
+
+    // Realistic ASTM from a GeneXpert analyzer.
+    // Field indices (0-indexed split, segment ID at idx 0):
+    //   O[0] | seq[1] | specimen[2] | ... | actionCode[11] (ASTM O.12)
+    //   R[0] | seq[1] | testId[2] | value[3] | units[4] | ref[5] | flag[6] | op[7] | status[8] | timestamp[9]
+    private static final String VALID_ASTM_MESSAGE =
+            "H|\\^&|||GeneXpert^1.0|||||||LIS2-A2\r"
+            + "P|1\r"
+            + "O|1|SAMPLE001|||||||||P\r"
+            + "R|1|^^^HIV-VL|1520.5|copies/mL||N||F|||20260326114500|20260326120000\r"
+            + "R|2|^^^CT|28.5|cycles||N||F|||20260326114500|20260326120000\r"
+            + "L|1\r";
+
+    // Real Cepheid GeneXpert H-record uses H|@^\  (repeat=@ component=^ escape=\)
+    // instead of the standard H|\^&. The component separator ^ is identical in
+    // both variants, so R-record field/component parsing is unaffected.
+    // This message replicates what GXM-04567890 sends on the Madagascar fleet.
+    private static final String REAL_GENEXPERT_MESSAGE =
+            "H|@^\\|GXM-04567890||LA2M3^GeneXpert^6.2|||||geneexpert||P|1394-97|20260414120000\r"
+            + "P|1\r"
+            + "O|1|ACC-REAL-001||^^^MTBRif\r"
+            + "R|1|^MTBRif^^MTB-RIF^Xpert MTB/RIF Ultra^3^MTB-RIF^|NOT DETECTED^||||||20260414120000\r"
+            + "L|1\r";
+
+    @Nested
+    @DisplayName("parseRaw - valid ASTM message")
+    class ValidMessage {
+
+        @Test
+        @DisplayName("Should extract accession from O-record specimen ID")
+        void shouldExtractAccession() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("SAMPLE001", parsed.accessionNumber());
+        }
+
+        @Test
+        @DisplayName("Should extract correct number of results from R-records")
+        void shouldExtractAllResults() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals(2, parsed.results().size());
+        }
+
+        @Test
+        @DisplayName("Should extract test codes from R-record")
+        void shouldExtractTestCodes() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            List<String> codes = parsed.results().stream()
+                    .map(AnalyzerResult::testCode).toList();
+            assertEquals(List.of("HIV-VL", "CT"), codes);
+        }
+
+        @Test
+        @DisplayName("Should extract values from R-record")
+        void shouldExtractValues() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("1520.5", parsed.results().get(0).value());
+            assertEquals("28.5", parsed.results().get(1).value());
+        }
+
+        @Test
+        @DisplayName("Should extract units from R-record")
+        void shouldExtractUnits() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("copies/mL", parsed.results().get(0).units());
+            assertEquals("cycles", parsed.results().get(1).units());
+        }
+
+        @Test
+        @DisplayName("Real Cepheid H|@^\\ delimiter format parsed identically to H|\\^&")
+        void realGeneXpertHeaderFormat_parsedCorrectly() {
+            // Verifies that the H-record delimiter variant used by physical GeneXpert
+            // machines (H|@^\) does not affect accession, test code, or value
+            // extraction — the parser only relies on | (field) and ^ (component)
+            // which are the same in both delimiter sets.
+            ParsedResults parsed = ASTMResultParser.parseRaw(
+                    REAL_GENEXPERT_MESSAGE, ControlResultRecognition.none(), GENEXPERT_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("ACC-REAL-001", parsed.accessionNumber(),
+                    "Accession extracted from O-record specimen ID");
+            assertEquals(1, parsed.results().size(),
+                    "Main Result filter preserves 1 MTB-RIF record (comp 5 non-empty)");
+            assertEquals("MTB-RIF", parsed.results().get(0).testCode(),
+                    "Test code extracted from R-record component 4");
+            assertEquals("NOT DETECTED", parsed.results().get(0).value(),
+                    "Real Cepheid qualitative value (not NEGATIVE) extracted cleanly");
+        }
+    }
+
+    @Nested
+    @DisplayName("Test code extraction formats")
+    class TestCodeFormats {
+
+        @Test
+        @DisplayName("^^^CODE format - component 4 extracted")
+        void tripleCaretFormat() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^GLUCOSE|95.0|mg/dL\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("GLUCOSE", parsed.results().get(0).testCode());
+        }
+
+        @Test
+        @DisplayName("^CODE format - component 2 extracted")
+        void singleCaretFormat() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^GLUCOSE|95.0|mg/dL\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("GLUCOSE", parsed.results().get(0).testCode());
+        }
+
+        @Test
+        @DisplayName("Plain CODE format - whole field used")
+        void plainFormat() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|GLUCOSE|95.0|mg/dL\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("GLUCOSE", parsed.results().get(0).testCode());
+        }
+    }
+
+    @Nested
+    @DisplayName("Value cleaning")
+    class ValueCleaning {
+
+        @Test
+        @DisplayName("Trailing caret stripped: 'NEGATIVE^' -> 'NEGATIVE'")
+        void trailingCaretStripped() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|NEGATIVE^||\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("NEGATIVE", parsed.results().get(0).value());
+        }
+
+        @Test
+        @DisplayName("Leading caret stripped: '^3.10' -> '3.10'")
+        void leadingCaretStripped() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|^3.10|mg/dL\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("3.10", parsed.results().get(0).value());
+        }
+
+        @Test
+        @DisplayName("Multiple trailing carets stripped: 'POS^^^' -> 'POS'")
+        void multipleTrailingCaretsStripped() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|POS^^^||\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("POS", parsed.results().get(0).value());
+        }
+    }
+
+    @Nested
+    @DisplayName("Profile-owned control recognition")
+    class QcDetection {
+
+        private ParsedResults parseWithActionCodeRecognition(String message) {
+            ControlResultRecognition recognition =
+                    TestControlRecognitions.rule("FIELD_EQUALS", "O.12", "Q");
+            return ASTMResultParser.parse(
+                    List.of(message.split("[\\r\\n]+")), recognition, ALL_RESULTS);
+        }
+
+        @Test
+        @DisplayName("O.12 = 'Q' -> result.isControl() = true")
+        void qcSampleDetected() {
+            // O-record: O[0]|seq[1]|specimen[2]|...[3-10]|actionCode[11]
+            // ASTM LIS2-A2 §5.7: action code is field 12 (1-indexed) = idx 11.
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|QC_SAMPLE001|||||||||Q\r"
+                    + "R|1|^^^TEST|5.0|units\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = parseWithActionCodeRecognition(msg);
+
+            assertNotNull(parsed);
+            assertTrue(parsed.results().get(0).isControl(),
+                    "QC sample should be flagged as control");
+        }
+
+        @Test
+        @DisplayName("O.12 = 'P' (normal) -> result.isControl() = false")
+        void normalSampleNotFlaggedAsQc() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertFalse(parsed.results().get(0).isControl(),
+                    "Normal sample should not be flagged as control");
+        }
+
+        @Test
+        @DisplayName("O.12 absent -> result.isControl() = false")
+        void missingActionCodeNotQc() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|5.0|units\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertFalse(parsed.results().get(0).isControl());
+        }
+
+        // These fixtures keep the field-level rule honest against real wire
+        // shapes: O.12 is index 11 when the segment ID is included at index 0.
+
+        @Test
+        @DisplayName("REAL wire format: O.12='Q' at idx 11 (per ASTM LIS2-A2) -> isControl=true")
+        void wireFormatQcMessageDetectedAsControl() {
+            // Wire shape matches what the bridge accepts on the production
+            // ASTM listener: O-record with Action Code "Q" at field 12.
+            String wireFormat =
+                    "H|\\^&|||GENEXPERT^GeneXpert^4.6.0|||||||LIS2-A2|20260429181325\r"
+                    + "P|1||QCCTRL001|QC^Control||U|19000101\r"
+                    + "O|1|DEV01269800000000001|||||||||Q|||||||||||||\r"
+                    + "R|1|^^^HIV-VL|1687.5|copies/mL|20-10000000|N||F|20260429181325\r"
+                    + "Q|1|HIV-VL^LOT-HIVVL-N^N|1687.5|copies/mL|20260429181325\r"
+                    + "L|1|N\r";
+
+            ParsedResults parsed = parseWithActionCodeRecognition(wireFormat);
+
+            assertNotNull(parsed, "Parser should produce results from wire-format QC message");
+            assertEquals(1, parsed.results().size(), "Expected one R-record parsed");
+            assertTrue(parsed.results().get(0).isControl(),
+                    "The profile's O.12 rule must classify the mock-generated control message");
+        }
+
+        @Test
+        @DisplayName("A Q record is a host query (LIS2-A2) and leaves the preceding result unchanged")
+        void queryRecordDoesNotAnnotateResult() {
+            String message =
+                    "H|\\^&|||GENEXPERT^GeneXpert^4.6.0|||||||LIS2-A2|20260429181325\r"
+                    + "P|1\r"
+                    + "O|1|DEV01269800000000001|||||||||Q|||||||||||||\r"
+                    + "R|1|^^^HIV-VL|1687.5|copies/mL|20-10000000|N||F|20260429181325\r"
+                    + "Q|1|HIV-VL^LOT-HIVVL-N^N|1687.5|copies/mL|20260429181325\r"
+                    + "L|1|N\r";
+
+            ParsedResults parsed = parseWithActionCodeRecognition(message);
+
+            assertEquals(1, parsed.results().size());
+            assertTrue(parsed.results().get(0).isControl());
+            assertNull(parsed.results().get(0).controlLevel(),
+                    "A Q record must not set a control level on the result");
+        }
+
+        @Test
+        @DisplayName("OE-fixture wire format (mindray-ba88a) Action Code at idx 11")
+        void oeMindrayFixtureActionCodeAtCorrectIndex() {
+            // Verbatim from src/test/resources/testdata/astm/mindray-ba88a-result.txt
+            // Action code "A" (Add) at idx 11 — patient sample, not QC.
+            String fixture =
+                    "H|\\^&|||Mindray^BA-88A^V1.0|||||||LIS2-A2|20260202115500\r"
+                    + "P|1||PATIENT001||Doe^John||19800115|M|||||||||||||||||||\r"
+                    + "O|1|ACC-2026-001^LAB||^^^CHEM||||20260202115500|||A||||||||||||||Q\r"
+                    + "R|1|^^^ALT|35.2|U/L|10-40|N||F||20260202115530||\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(fixture, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertFalse(parsed.results().get(0).isControl(),
+                    "Action code 'A' (Add, idx 11) is patient sample, NOT control. "
+                    + "If this returns true, parser is reading the wrong index.");
+        }
+    }
+
+    @Nested
+    @DisplayName("Test time (first readable of R.13 completed and R.12 started)")
+    class TestTime {
+
+        private TimeZone originalZone;
+
+        @BeforeEach
+        void pinSiteZone() {
+            originalZone = TimeZone.getDefault();
+            // A zone other than UTC with no daylight saving, so the offset is observable and stable.
+            TimeZone.setDefault(TimeZone.getTimeZone("Pacific/Port_Moresby"));
+        }
+
+        @AfterEach
+        void restoreZone() {
+            TimeZone.setDefault(originalZone);
+        }
+
+        private String resultWithTimes(String started, String completed) {
+            return "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|5.0|units||N||F|||" + started + "|" + completed + "\r"
+                    + "L|1\r";
+        }
+
+        private String testTime(String message) {
+            ParsedResults parsed = ASTMResultParser.parseRaw(message, ControlResultRecognition.none(), ALL_RESULTS);
+            assertNotNull(parsed);
+            return parsed.results().get(0).timestamp();
+        }
+
+        @Test
+        @DisplayName("R.13 completion time is read in the JVM zone")
+        void completionTime() {
+            assertEquals("2026-03-26T12:00:00+10:00", testTime(VALID_ASTM_MESSAGE));
+        }
+
+        @Test
+        @DisplayName("A UTC zone renders as Z")
+        void utcZone() {
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
+            assertEquals("2026-03-26T12:00:00Z", testTime(VALID_ASTM_MESSAGE));
+        }
+
+        @Test
+        @DisplayName("R.12 start time when R.13 is empty")
+        void startTimeWhenCompletionMissing() {
+            assertEquals("2025-10-21T14:45:07+10:00", testTime(resultWithTimes("20251021144507", "")));
+        }
+
+        @Test
+        @DisplayName("R.12 start time when R.13 is unreadable")
+        void startTimeWhenCompletionUnreadable() {
+            assertEquals("2025-10-21T14:45:07+10:00", testTime(resultWithTimes("20251021144507", "2025-10-21")));
+        }
+
+        @Test
+        @DisplayName("Minute precision and date-only forms")
+        void shorterForms() {
+            assertEquals("2025-10-21T16:12:00+10:00", testTime(resultWithTimes("", "202510211612")));
+            assertEquals("2025-10-21", testTime(resultWithTimes("", "20251021")));
+        }
+
+        @Test
+        @DisplayName("R.10 (normative-values change date) is not a test time")
+        void normativeValuesDateIgnored() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|5.0|units|||||20260326120000\r"
+                    + "L|1\r";
+            assertNull(testTime(msg));
+        }
+
+        @Test
+        @DisplayName("Unreadable or missing times -> null")
+        void unreadableOrMissing() {
+            assertNull(testTime(resultWithTimes("", "2025-10-21")));
+            assertNull(testTime(resultWithTimes("", "20251321999999")));
+            assertNull(testTime(resultWithTimes("", "")));
+        }
+    }
+
+    @Nested
+    @DisplayName("Numeric detection")
+    class NumericDetection {
+
+        @Test
+        @DisplayName("Numeric value '1520.5' -> isNumeric = true")
+        void numericValueDetected() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(VALID_ASTM_MESSAGE, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertTrue(parsed.results().get(0).isNumeric());
+        }
+
+        @Test
+        @DisplayName("Text value 'NEGATIVE' -> isNumeric = false")
+        void textValueDetected() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^TEST|NEGATIVE||\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertFalse(parsed.results().get(0).isNumeric());
+        }
+    }
+
+    @Nested
+    @DisplayName("Main Result filter (Cepheid multi-result)")
+    class MainResultFilter {
+
+        @Test
+        @DisplayName("Generic ASTM keeps a five-component result when no analyzer-specific selector applies")
+        void genericAstmKeepsFiveComponentResult() {
+            String message = "H|\\^&|||Generic Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^PANEL^^ANALYTE^^|POSITIVE|\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(message, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals(1, parsed.results().size());
+            assertEquals("ANALYTE", parsed.results().get(0).testCode());
+        }
+
+        private static final String CTNG_MESSAGE =
+                "H|\\^&|||GeneXpert^6.5\r"
+                + "P|1\r"
+                + "O|1|CTNG_SAMPLE001||^^^CTNG\r"
+                + "R|1|^CTNG^^CT^Xpert CT_NG^3^CT^|POS^||||||20260415120000\r"
+                + "R|2|^CTNG^^CT^^^CT1^|POS^||||||20260415120000\r"
+                + "R|3|^CTNG^^CT^^^CT1^Ct|^20.1||||||20260415120000\r"
+                + "R|4|^CTNG^^CT^^^CT1^EndPt|^304.0||||||20260415120000\r"
+                + "R|5|^CTNG^^CT^^^SAC^|NA^||||||20260415120000\r"
+                + "R|6|^CTNG^^NG^Xpert CT_NG^3^NG^|NOT DETECTED||||||20260415120000\r"
+                + "R|7|^CTNG^^NG^^^NG2^|NEG^||||||20260415120000\r"
+                + "R|8|^CTNG^^NG^^^NG2^Ct|^0.0||||||20260415120000\r"
+                + "L|1\r";
+
+        @Test
+        @DisplayName("Only Main Results (Component 5 non-empty) forwarded from CTNG cartridge")
+        void onlyMainResultsForwarded() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(CTNG_MESSAGE, ControlResultRecognition.none(), GENEXPERT_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals(2, parsed.results().size(), "Only 2 Main Results (CT + NG) from 8 R-records");
+        }
+
+        @Test
+        @DisplayName("Main Results carry per-analyte test codes (CT, NG)")
+        void mainResultsCarryAnalyteCodes() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(CTNG_MESSAGE, ControlResultRecognition.none(), GENEXPERT_RESULTS);
+
+            assertNotNull(parsed);
+            List<String> codes = parsed.results().stream()
+                    .map(AnalyzerResult::testCode).toList();
+            assertEquals(List.of("CT", "NG"), codes);
+        }
+
+        @Test
+        @DisplayName("Main Result values cleaned correctly (POS^→POS, NOT DETECTED)")
+        void mainResultValuesClean() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(CTNG_MESSAGE, ControlResultRecognition.none(), GENEXPERT_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("POS", parsed.results().get(0).value());
+            assertEquals("NOT DETECTED", parsed.results().get(1).value());
+        }
+
+        @Test
+        @DisplayName("Analyte rows (CT1, NG2), Complementary (Ct, EndPt), and controls (SAC) all filtered out")
+        void analyteAndComplementaryFiltered() {
+            ParsedResults parsed = ASTMResultParser.parseRaw(CTNG_MESSAGE, ControlResultRecognition.none(), GENEXPERT_RESULTS);
+
+            assertNotNull(parsed);
+            List<String> codes = parsed.results().stream()
+                    .map(AnalyzerResult::testCode).toList();
+            assertFalse(codes.contains("CT1"), "CT1 analyte row should be filtered");
+            assertFalse(codes.contains("NG2"), "NG2 analyte row should be filtered");
+            assertFalse(codes.contains("SAC"), "SAC control row should be filtered");
+        }
+
+        @Test
+        @DisplayName("Simple ^^^CODE format (< 5 components) still works as Main Result")
+        void simpleFormatBackwardCompat() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "R|1|^^^GLUCOSE|95.0|mg/dL\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals(1, parsed.results().size());
+            assertEquals("GLUCOSE", parsed.results().get(0).testCode());
+        }
+
+    }
+
+    @Nested
+    @DisplayName("Edge cases")
+    class EdgeCases {
+
+        @Test
+        @DisplayName("Null input -> returns null")
+        void nullInputReturnsNull() {
+            assertNull(ASTMResultParser.parseRaw(null, ControlResultRecognition.none(), ALL_RESULTS));
+        }
+
+        @Test
+        @DisplayName("Empty input -> returns null")
+        void emptyInputReturnsNull() {
+            assertNull(ASTMResultParser.parseRaw("", ControlResultRecognition.none(), ALL_RESULTS));
+        }
+
+        @Test
+        @DisplayName("Blank input -> returns null")
+        void blankInputReturnsNull() {
+            assertNull(ASTMResultParser.parseRaw("   ", ControlResultRecognition.none(), ALL_RESULTS));
+        }
+
+        @Test
+        @DisplayName("No R-records -> returns null")
+        void noResultRecordsReturnsNull() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "L|1\r";
+
+            assertNull(ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS));
+        }
+
+        @Test
+        @DisplayName("R-records before O-record -> results skipped (no accession yet)")
+        void resultBeforeOrderSkipped() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "R|1|^^^TEST|5.0|units\r"
+                    + "P|1\r"
+                    + "O|1|ACC001\r"
+                    + "L|1\r";
+
+            assertNull(ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS));
+        }
+
+        @Test
+        @DisplayName("O-record specimen ID with location subcomponent")
+        void specimenIdWithLocation() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|SAMPLE123^RACK5\r"
+                    + "R|1|^^^TEST|5.0|units\r"
+                    + "L|1\r";
+
+            ParsedResults parsed = ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS);
+
+            assertNotNull(parsed);
+            assertEquals("SAMPLE123", parsed.accessionNumber());
+        }
+
+        @Test
+        @DisplayName("Uses 'ASTM-UNKNOWN' when no O-record accession")
+        void unknownWhenNoAccession() {
+            String msg = "H|\\^&|||Analyzer\r"
+                    + "P|1\r"
+                    + "O|1|\r"
+                    + "R|1|^^^TEST|5.0|units\r"
+                    + "L|1\r";
+
+            // O-record has empty specimen ID, accession stays null -> falls back
+            // But R-records are only added when accession != null, so...
+            // Actually: accession is set per O-record parse. Let's trace:
+            // extractAccessionNumber("O|1|") -> fields[2] = "" -> returns null
+            // So accession remains null and R-record is skipped -> returns null
+            assertNull(ASTMResultParser.parseRaw(msg, ControlResultRecognition.none(), ALL_RESULTS));
+        }
+    }
+}

@@ -1,0 +1,528 @@
+package org.itech.ahb.fhir;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import ca.uhn.fhir.context.FhirContext;
+import java.math.BigDecimal;
+import java.util.List;
+import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.Coding;
+import org.hl7.fhir.r4.model.DiagnosticReport;
+import org.hl7.fhir.r4.model.Observation;
+import org.hl7.fhir.r4.model.Quantity;
+import org.hl7.fhir.r4.model.Reference;
+import org.hl7.fhir.r4.model.Specimen;
+import org.hl7.fhir.r4.model.StringType;
+import org.itech.ahb.fhir.FhirBundleBuilder.AnalyzerContext;
+import org.itech.ahb.fhir.FhirBundleBuilder.AnalyzerResult;
+import org.itech.ahb.fhir.FhirBundleBuilder.DeviceInfo;
+import org.itech.ahb.profile.ControlRecognitionRule;
+import org.itech.ahb.profile.ControlResultRecognition;
+import org.itech.ahb.profile.ControlResultRecognitionEvaluator;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+/**
+ * Unit tests for {@link FhirBundleBuilder}.
+ *
+ * <p>Validates FHIR R4 transaction Bundle construction: resource types,
+ * Specimen identifiers, Observation codes/values, QC tagging, timestamp
+ * handling, and internal reference consistency.
+ */
+@DisplayName("FhirBundleBuilder")
+class FhirBundleBuilderTest {
+
+    private static final String DELIVERY_ID = "astm-v1:" + "c".repeat(64);
+
+    private static final FhirContext CTX = FhirContext.forR4();
+    private static final String ACCESSION = "ACC-2026-001";
+
+    private Bundle parseBundle(String json) {
+        return CTX.newJsonParser().parseResource(Bundle.class, json);
+    }
+
+    private String buildBundle(List<AnalyzerResult> results) {
+        boolean containsControl = results.stream().anyMatch(AnalyzerResult::isControl);
+        ControlResultRecognition recognition = containsControl
+                ? ControlResultRecognition.rules(List.of(new ControlRecognitionRule(
+                        "test-control", "SPECIMEN_ID_PREFIX", null, "ACC-", null, null)))
+                : ControlResultRecognition.none();
+        List<AnalyzerResult> assessed = results;
+        if (containsControl) {
+            ControlResultRecognitionEvaluator.Assessment assessment =
+                    ControlResultRecognitionEvaluator.evaluate(recognition, ACCESSION, java.util.Map.of());
+            assessed = results.stream()
+                    .map(result -> result.withControlRecognition(assessment))
+                    .toList();
+        }
+        AnalyzerContext context = new AnalyzerContext(
+                "bridge-connection-test",
+                "oe-analyzer-test",
+                "site.test-profile",
+                1,
+                "ASTM",
+                "TCP",
+                DeviceInfo.fromSenderToken("127.0.0.1", "TEST"),
+                recognition,
+                "sha256:" + "0".repeat(64));
+        return FhirBundleBuilder.buildNormalizedBundle(ACCESSION, assessed, context, code -> null, DELIVERY_ID);
+    }
+
+    @Nested
+    @DisplayName("Bundle structure")
+    class BundleStructure {
+
+        @Test
+        @DisplayName("The device names the fingerprint of the profile content the message was read with")
+        void theDeviceCarriesTheProfileFingerprint() {
+            String fingerprint = "sha256:" + "a".repeat(64);
+            AnalyzerContext context = new AnalyzerContext(
+                    "bridge-connection-test",
+                    "oe-analyzer-test",
+                    "site.test-profile",
+                    1,
+                    "ASTM",
+                    "TCP",
+                    DeviceInfo.fromSenderToken("127.0.0.1", "TEST"),
+                    ControlResultRecognition.none(),
+                    "sha256:" + "0".repeat(64),
+                    fingerprint);
+
+            Bundle bundle = parseBundle(FhirBundleBuilder.buildNormalizedBundle(ACCESSION,
+                    List.of(AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL")), context, code -> null,
+                    DELIVERY_ID));
+
+            org.hl7.fhir.r4.model.Device device = bundle.getEntry().stream()
+                    .map(Bundle.BundleEntryComponent::getResource)
+                    .filter(org.hl7.fhir.r4.model.Device.class::isInstance)
+                    .map(org.hl7.fhir.r4.model.Device.class::cast)
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(fingerprint, device.getExtensionByUrl(
+                    "https://openelis-global.org/fhir/StructureDefinition/analyzer-profile-fingerprint")
+                    .getValue().primitiveValue());
+        }
+
+        @Test
+        @DisplayName("Should produce valid JSON parseable by HAPI FhirContext")
+        void shouldProduceValidJson() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            String json = buildBundle(results);
+
+            assertNotNull(json);
+            assertDoesNotThrow(() -> parseBundle(json));
+        }
+
+        @Test
+        @DisplayName("Bundle type should be TRANSACTION")
+        void bundleTypeShouldBeTransaction() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            assertEquals(Bundle.BundleType.TRANSACTION, bundle.getType());
+        }
+
+        @Test
+        @DisplayName("Should contain Specimen, Observation(s), and DiagnosticReport")
+        void shouldContainExpectedResourceTypes() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"),
+                    AnalyzerResult.text("INTERP", "INTERP", "Normal"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            long specimenCount = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Specimen).count();
+            long observationCount = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation).count();
+            long reportCount = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof DiagnosticReport).count();
+
+            assertEquals(1, specimenCount, "Should have exactly 1 Specimen");
+            assertEquals(2, observationCount, "Should have 1 Observation per result");
+            assertEquals(1, reportCount, "Should have exactly 1 DiagnosticReport");
+        }
+
+        @Test
+        @DisplayName("All entries should have POST request method")
+        void allEntriesShouldHavePostMethod() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
+                assertEquals(Bundle.HTTPVerb.POST, entry.getRequest().getMethod());
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("Specimen")
+    class SpecimenTests {
+
+        @Test
+        @DisplayName("Specimen.identifier matches accession number")
+        void specimenIdentifierMatchesAccession() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Specimen specimen = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Specimen)
+                    .map(e -> (Specimen) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertEquals(ACCESSION, specimen.getIdentifierFirstRep().getValue());
+        }
+    }
+
+    @Nested
+    @DisplayName("Observation values")
+    class ObservationValues {
+
+        @Test
+        @DisplayName("Observation.code matches test code")
+        void observationCodeMatchesTestCode() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "White Blood Cells", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            Coding coding = obs.getCode().getCodingFirstRep();
+            assertEquals("WBC", coding.getCode());
+            assertEquals("White Blood Cells", coding.getDisplay());
+        }
+
+        @Test
+        @DisplayName("Numeric value -> valueQuantity with correct value and unit")
+        void numericValueProducesQuantity() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertTrue(obs.getValue() instanceof Quantity);
+            Quantity qty = (Quantity) obs.getValue();
+            assertEquals(0, new BigDecimal("7.5").compareTo(qty.getValue()));
+            assertEquals("10*3/uL", qty.getUnit());
+        }
+
+        @Test
+        @DisplayName("Text value -> valueString")
+        void textValueProducesString() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.text("INTERP", "Interpretation", "Normal"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertTrue(obs.getValue() instanceof StringType);
+            assertEquals("Normal", ((StringType) obs.getValue()).getValue());
+        }
+
+        @Test
+        @DisplayName("Numeric value with null units -> Quantity without unit")
+        void numericWithNullUnits() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("RATIO", "RATIO", "1.5", null));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            Quantity qty = (Quantity) obs.getValue();
+            assertEquals(0, new BigDecimal("1.5").compareTo(qty.getValue()));
+            assertNull(qty.getUnit());
+        }
+    }
+
+    @Nested
+    @DisplayName("QC tagging")
+    class QcTagging {
+
+        @Test
+        @DisplayName("QC result -> Meta tag with 'QC' code")
+        void qcResultHasMetaTag() {
+            AnalyzerResult qcResult = AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL")
+                    .withControl(true);
+
+            Bundle bundle = parseBundle(
+                    buildBundle(List.of(qcResult)));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            List<Coding> tags = obs.getMeta().getTag();
+            assertFalse(tags.isEmpty(), "QC observation should have meta tags");
+            assertTrue(tags.stream().anyMatch(t ->
+                            "QC".equals(t.getCode())
+                            && "http://openelis-global.org/fhir/tags".equals(t.getSystem())),
+                    "Should have QC tag with correct system");
+        }
+
+        @Test
+        @DisplayName("Non-QC result -> no Meta tag")
+        void nonQcResultHasNoMetaTag() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertTrue(obs.getMeta().getTag().isEmpty(),
+                    "Non-QC observation should have no meta tags");
+        }
+
+        @Test
+        @DisplayName("A control's level is emitted as the control-level extension, and no lot or type is sent")
+        void controlLevelExtensionIsEmitted() {
+            AnalyzerResult qcResult = AnalyzerResult.numeric("HIV-VL", "HIV-VL", "1687.5", "copies/mL")
+                    .withControl(true)
+                    .withControlLevel("LPC");
+
+            Bundle bundle = parseBundle(
+                    buildBundle(List.of(qcResult)));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            var level = obs.getExtensionByUrl("http://openelis-global.org/fhir/qc/control-level");
+            assertNotNull(level, "qc/control-level extension must be present");
+            assertEquals("LPC",
+                    ((org.hl7.fhir.r4.model.StringType) level.getValue()).getValue());
+            assertNull(obs.getExtensionByUrl("http://openelis-global.org/fhir/qc/lot-number"));
+            assertNull(obs.getExtensionByUrl("http://openelis-global.org/fhir/qc/control-type"));
+        }
+
+        @Test
+        @DisplayName("QC without a level -> qc extensions absent")
+        void qcExtensionsAbsentWhenLevelNull() {
+            AnalyzerResult qcResult = AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL")
+                    .withControl(true);
+
+            Bundle bundle = parseBundle(
+                    buildBundle(List.of(qcResult)));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertNull(obs.getExtensionByUrl("http://openelis-global.org/fhir/qc/lot-number"));
+            assertNull(obs.getExtensionByUrl("http://openelis-global.org/fhir/qc/control-level"));
+            assertNull(obs.getExtensionByUrl("http://openelis-global.org/fhir/qc/control-type"));
+        }
+    }
+
+    @Nested
+    @DisplayName("Timestamp handling")
+    class TimestampHandling {
+
+        @Test
+        @DisplayName("Valid timestamp -> effectiveDateTime set")
+        void validTimestampSetsEffective() {
+            AnalyzerResult result = AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL")
+                    .withTimestamp("2025-10-21T16:12:30+10:00");
+
+            Bundle bundle = parseBundle(
+                    buildBundle(List.of(result)));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertNotNull(obs.getEffective(), "effectiveDateTime should be set");
+            assertEquals("2025-10-21T16:12:30+10:00", obs.getEffectiveDateTimeType().getValueAsString());
+        }
+
+        @Test
+        @DisplayName("Date-only timestamp -> effectiveDateTime at day precision")
+        void dateOnlyTimestamp() {
+            AnalyzerResult result = AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL")
+                    .withTimestamp("2025-10-21");
+
+            Bundle bundle = parseBundle(buildBundle(List.of(result)));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+            assertEquals("2025-10-21", obs.getEffectiveDateTimeType().getValueAsString());
+        }
+
+        /** A regression pin: a time the builder cannot read never costs the result itself. */
+        @Test
+        @DisplayName("Unreadable timestamp -> result still built, no effectiveDateTime")
+        void unreadableTimestampKeepsTheResult() {
+            for (String unreadable : List.of("2025-10-21T16:12+10:00", "20251021161230", "not a time")) {
+                AnalyzerResult result = AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL")
+                        .withTimestamp(unreadable);
+
+                Bundle bundle = parseBundle(buildBundle(List.of(result)));
+
+                Observation obs = bundle.getEntry().stream()
+                        .filter(e -> e.getResource() instanceof Observation)
+                        .map(e -> (Observation) e.getResource())
+                        .findFirst().orElseThrow();
+                assertNull(obs.getEffective(), unreadable + " should leave effectiveDateTime unset");
+            }
+        }
+
+        @Test
+        @DisplayName("Null timestamp -> no effectiveDateTime")
+        void nullTimestampNoEffective() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertNull(obs.getEffective(), "effectiveDateTime should not be set");
+        }
+    }
+
+    @Nested
+    @DisplayName("Internal reference consistency")
+    class ReferenceConsistency {
+
+        @Test
+        @DisplayName("DiagnosticReport.result references match Observation fullUrls")
+        void reportResultRefsMatchObservationUrls() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"),
+                    AnalyzerResult.numeric("RBC", "RBC", "4.82", "10*6/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            // Collect Observation fullUrls
+            List<String> obsUrls = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(Bundle.BundleEntryComponent::getFullUrl)
+                    .toList();
+
+            // Collect DiagnosticReport result references
+            DiagnosticReport report = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof DiagnosticReport)
+                    .map(e -> (DiagnosticReport) e.getResource())
+                    .findFirst().orElseThrow();
+
+            List<String> reportRefs = report.getResult().stream()
+                    .map(Reference::getReference)
+                    .toList();
+
+            assertEquals(obsUrls.size(), reportRefs.size(),
+                    "Report should reference all observations");
+            assertTrue(obsUrls.containsAll(reportRefs),
+                    "All report references should match observation fullUrls");
+        }
+
+        @Test
+        @DisplayName("Observation.specimen references match Specimen fullUrl")
+        void observationSpecimenRefMatchesSpecimenUrl() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            String specimenUrl = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Specimen)
+                    .map(Bundle.BundleEntryComponent::getFullUrl)
+                    .findFirst().orElseThrow();
+
+            Observation obs = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Observation)
+                    .map(e -> (Observation) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertEquals(specimenUrl, obs.getSpecimen().getReference(),
+                    "Observation specimen reference should match Specimen fullUrl");
+        }
+
+        @Test
+        @DisplayName("DiagnosticReport.specimen references match Specimen fullUrl")
+        void reportSpecimenRefMatchesSpecimenUrl() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            String specimenUrl = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof Specimen)
+                    .map(Bundle.BundleEntryComponent::getFullUrl)
+                    .findFirst().orElseThrow();
+
+            DiagnosticReport report = bundle.getEntry().stream()
+                    .filter(e -> e.getResource() instanceof DiagnosticReport)
+                    .map(e -> (DiagnosticReport) e.getResource())
+                    .findFirst().orElseThrow();
+
+            assertEquals(specimenUrl, report.getSpecimenFirstRep().getReference(),
+                    "DiagnosticReport specimen reference should match Specimen fullUrl");
+        }
+
+        @Test
+        @DisplayName("All fullUrls use urn:uuid: scheme")
+        void allFullUrlsUseUrnUuid() {
+            List<AnalyzerResult> results = List.of(
+                    AnalyzerResult.numeric("WBC", "WBC", "7.5", "10*3/uL"));
+
+            Bundle bundle = parseBundle(
+                    buildBundle(results));
+
+            for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
+                assertTrue(entry.getFullUrl().startsWith("urn:uuid:"),
+                        "fullUrl should use urn:uuid: scheme, got: " + entry.getFullUrl());
+            }
+        }
+    }
+}

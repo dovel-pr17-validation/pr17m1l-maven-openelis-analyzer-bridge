@@ -1,0 +1,291 @@
+package org.itech.ahb.normalizer;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+import org.itech.ahb.connection.AnalyzerRuntimeRegistry;
+import org.itech.ahb.model.Protocol;
+import org.itech.ahb.model.Transport;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+import java.util.Optional;
+
+/**
+ * Unit tests for AnalyzerIdentifier.
+ * <p>
+ * Tests multi-strategy analyzer identification using registry lookups
+ * (direct match, pattern match, fallback to null).
+ * </p>
+ */
+class AnalyzerIdentifierTest {
+
+    private AnalyzerIdentifier identifier;
+    private AnalyzerRuntimeRegistry mockRegistry;
+
+    @Nested
+    @DisplayName("Source Registry Authority Tests")
+    class ProtocolHintCompatibilityTests {
+
+        @BeforeEach
+        void setUp() {
+            mockRegistry = mock(AnalyzerRuntimeRegistry.class);
+            identifier = new AnalyzerIdentifier(mockRegistry);
+        }
+
+        @Test
+        @DisplayName("Should resolve analyzer ID from the source registry")
+        void shouldResolveAnalyzerIdFromSourceRegistry() {
+            when(mockRegistry.findAnalyzerId("/dev/ttyUSB0")).thenReturn(Optional.of("HORIBA-001"));
+
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.SERIAL)
+                .sourceId("/dev/ttyUSB0")
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("HORIBA-001", result);
+            verify(mockRegistry).findAnalyzerId("/dev/ttyUSB0");
+        }
+
+        @Test
+        @DisplayName("Should resolve the registered source independently of message content")
+        void shouldResolveRegisteredSourceIndependentlyOfMessageContent() {
+            when(mockRegistry.findAnalyzerId("192.168.1.10")).thenReturn(Optional.of("SYSMEX-001"));
+
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.HL7)
+                .transport(Transport.MLLP)
+                .sourceId("192.168.1.10")
+                .rawMessage("MSH|^~\\&|||")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("SYSMEX-001", result);
+            verify(mockRegistry).findAnalyzerId("192.168.1.10");
+        }
+    }
+
+    @Nested
+    @DisplayName("Registry Lookup Strategy Tests")
+    class RegistryLookupTests {
+
+        @BeforeEach
+        void setUp() {
+            mockRegistry = mock(AnalyzerRuntimeRegistry.class);
+            identifier = new AnalyzerIdentifier(mockRegistry);
+        }
+
+        @Test
+        @DisplayName("Should return analyzer ID from direct IP match")
+        void shouldReturnAnalyzerIdFromIPMatch() {
+            when(mockRegistry.findAnalyzerId("192.168.1.10")).thenReturn(Optional.of("MINDRAY-001"));
+
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.TCP)
+                .sourceId("192.168.1.10")
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("MINDRAY-001", result);
+        }
+
+        @Test
+        @DisplayName("Should return analyzer ID from serial port match")
+        void shouldReturnAnalyzerIdFromSerialPortMatch() {
+            when(mockRegistry.findAnalyzerId("/dev/ttyUSB0")).thenReturn(Optional.of("HORIBA-001"));
+
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.SERIAL)
+                .sourceId("/dev/ttyUSB0")
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("HORIBA-001", result);
+        }
+
+        @Test
+        @DisplayName("Should return analyzer ID from file path pattern match")
+        void shouldReturnAnalyzerIdFromFilePathPattern() {
+            when(mockRegistry.findAnalyzerId("/mnt/analyzer/quantstudio-20260205.csv"))
+                .thenReturn(Optional.of("QUANTSTUDIO-001"));
+
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.CSV)
+                .transport(Transport.FILE)
+                .sourceId("/mnt/analyzer/quantstudio-20260205.csv")
+                .rawMessage("SampleID,TestCode,Result")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("QUANTSTUDIO-001", result);
+        }
+
+        @Test
+        @DisplayName("Should return null when registry returns empty")
+        void shouldReturnNullWhenRegistryReturnsEmpty() {
+            when(mockRegistry.findAnalyzerId("192.168.1.99")).thenReturn(Optional.empty());
+
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.HL7)
+                .transport(Transport.TCP)
+                .sourceId("192.168.1.99")
+                .rawMessage("MSH|^~\\&|||")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertNull(result);
+        }
+    }
+
+    @Nested
+    @DisplayName("Edge Case Tests")
+    class EdgeCaseTests {
+
+        @BeforeEach
+        void setUp() {
+            mockRegistry = mock(AnalyzerRuntimeRegistry.class);
+            identifier = new AnalyzerIdentifier(mockRegistry);
+        }
+
+        @Test
+        @DisplayName("Should return null when sourceId is null")
+        void shouldReturnNullWhenSourceIdIsNull() {
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.SERIAL)
+                .sourceId(null)
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertNull(result);
+            verify(mockRegistry, never()).findAnalyzerId(anyString());
+        }
+
+        @Test
+        @DisplayName("Should return null when sourceId is empty")
+        void shouldReturnNullWhenSourceIdIsEmpty() {
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.SERIAL)
+                .sourceId("")
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertNull(result);
+            verify(mockRegistry, never()).findAnalyzerId(anyString());
+        }
+
+    }
+
+    @Nested
+    @DisplayName("Integration with Real Registry Tests")
+    class RealRegistryTests {
+
+        private AnalyzerRuntimeRegistry realRegistry;
+
+        @BeforeEach
+        void setUp() {
+            realRegistry = new AnalyzerRuntimeRegistry();
+
+            AnalyzerRuntimeRegistry.AnalyzerEntry mindray = new AnalyzerRuntimeRegistry.AnalyzerEntry();
+            mindray.setId("MINDRAY-001");
+            mindray.setName("Mindray BC-5380");
+            mindray.setExpectedProtocol("ASTM");
+            realRegistry.register("192.168.1.10", mindray);
+
+            AnalyzerRuntimeRegistry.AnalyzerEntry horiba = new AnalyzerRuntimeRegistry.AnalyzerEntry();
+            horiba.setId("HORIBA-001");
+            horiba.setName("Horiba Pentra 60");
+            horiba.setExpectedProtocol("ASTM");
+            realRegistry.register("/dev/ttyUSB0", horiba);
+
+            AnalyzerRuntimeRegistry.AnalyzerEntry quantstudio = new AnalyzerRuntimeRegistry.AnalyzerEntry();
+            quantstudio.setId("QUANTSTUDIO-001");
+            quantstudio.setName("QuantStudio 7 Flex");
+            quantstudio.setExpectedProtocol("CSV");
+            quantstudio.setFilePattern(".*/quantstudio-.*\\.csv");
+            realRegistry.register("quantstudio-*", quantstudio);
+
+            identifier = new AnalyzerIdentifier(realRegistry);
+        }
+
+        @Test
+        @DisplayName("Should identify analyzer by IP using real registry")
+        void shouldIdentifyByIPWithRealRegistry() {
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.TCP)
+                .sourceId("192.168.1.10")
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("MINDRAY-001", result);
+        }
+
+        @Test
+        @DisplayName("Should identify analyzer by serial port using real registry")
+        void shouldIdentifyBySerialPortWithRealRegistry() {
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.ASTM)
+                .transport(Transport.SERIAL)
+                .sourceId("/dev/ttyUSB0")
+                .rawMessage("H|\\^&|||TEST")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("HORIBA-001", result);
+        }
+
+        @Test
+        @DisplayName("Should identify analyzer by glob pattern using real registry")
+        void shouldIdentifyByGlobPatternWithRealRegistry() {
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.CSV)
+                .transport(Transport.FILE)
+                .sourceId("quantstudio-20260205.csv")
+                .rawMessage("SampleID,TestCode,Result")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertEquals("QUANTSTUDIO-001", result);
+        }
+
+        @Test
+        @DisplayName("Should return null for unregistered analyzer using real registry")
+        void shouldReturnNullForUnregisteredAnalyzerWithRealRegistry() {
+            MessageEnvelope envelope = MessageEnvelope.builder()
+                .protocol(Protocol.HL7)
+                .transport(Transport.TCP)
+                .sourceId("192.168.1.99")
+                .rawMessage("MSH|^~\\&|||")
+                .build();
+
+            String result = identifier.identify(envelope);
+
+            assertNull(result);
+        }
+    }
+}

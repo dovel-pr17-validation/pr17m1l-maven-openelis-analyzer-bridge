@@ -1,0 +1,593 @@
+package org.itech.ahb.connection;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import org.itech.ahb.connection.AnalyzerRuntimeRegistry.AnalyzerEntry;
+import org.itech.ahb.fhir.TabularFileLayout;
+import org.itech.ahb.file.FileWatcher;
+import org.itech.ahb.profile.AstmResultRecordSelection;
+import org.itech.ahb.profile.ControlResultRecognition;
+import org.itech.ahb.profile.TabularResultValueSelection;
+import org.itech.ahb.profile.TestCodings;
+import org.itech.ahb.util.IpLiteral;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/** Materializes durable connections into the established Bridge runtime. */
+public final class BridgeAnalyzerConnectionRuntime implements AnalyzerConnectionRuntime {
+
+  private static final Logger log = LoggerFactory.getLogger(BridgeAnalyzerConnectionRuntime.class);
+
+  private final AnalyzerRuntimeRegistry registry;
+  private final FileWatcher fileWatcher;
+  private final AstmConnectionListeners astmListeners;
+  private final SerialConnectionListeners serialListeners;
+  private final Hl7ConnectionListeners hl7Listeners;
+  private final AnalyzerListenerPorts listenerPorts;
+  private final AnalyzerOutboundEndpoint outboundEndpoint;
+  private final Map<String, ActiveMaterialization> activeConnections = new ConcurrentHashMap<>();
+
+  public BridgeAnalyzerConnectionRuntime(
+    AnalyzerRuntimeRegistry registry,
+    FileWatcher fileWatcher,
+    AstmConnectionListeners astmListeners,
+    SerialConnectionListeners serialListeners
+  ) {
+    this(registry, fileWatcher, astmListeners, serialListeners, null);
+  }
+
+  public BridgeAnalyzerConnectionRuntime(
+    AnalyzerRuntimeRegistry registry,
+    FileWatcher fileWatcher,
+    AstmConnectionListeners astmListeners,
+    SerialConnectionListeners serialListeners,
+    Hl7ConnectionListeners hl7Listeners
+  ) {
+    this(registry, fileWatcher, astmListeners, serialListeners, hl7Listeners, AnalyzerListenerPorts.defaults());
+  }
+
+  public BridgeAnalyzerConnectionRuntime(
+    AnalyzerRuntimeRegistry registry,
+    FileWatcher fileWatcher,
+    AstmConnectionListeners astmListeners,
+    SerialConnectionListeners serialListeners,
+    Hl7ConnectionListeners hl7Listeners,
+    AnalyzerListenerPorts listenerPorts
+  ) {
+    this(
+      registry,
+      fileWatcher,
+      astmListeners,
+      serialListeners,
+      hl7Listeners,
+      listenerPorts,
+      new AnalyzerOutboundEndpoint(new AnalyzerOutboundDefaults())
+    );
+  }
+
+  public BridgeAnalyzerConnectionRuntime(
+    AnalyzerRuntimeRegistry registry,
+    FileWatcher fileWatcher,
+    AstmConnectionListeners astmListeners,
+    SerialConnectionListeners serialListeners,
+    Hl7ConnectionListeners hl7Listeners,
+    AnalyzerListenerPorts listenerPorts,
+    AnalyzerOutboundEndpoint outboundEndpoint
+  ) {
+    this.outboundEndpoint = outboundEndpoint;
+    this.listenerPorts = listenerPorts;
+    this.registry = registry;
+    this.fileWatcher = fileWatcher;
+    this.astmListeners = astmListeners;
+    this.serialListeners = serialListeners;
+    this.hl7Listeners = hl7Listeners;
+  }
+
+  @Override
+  public synchronized void activate(ObjectNode connection, ObjectNode profile) {
+    activate(connection, profile, true);
+  }
+
+  private void activate(ObjectNode connection, ObjectNode profile, boolean refuseIndistinguishable) {
+    String connectionId = requiredText(connection, "connectionId", "Connection ID");
+    ActiveMaterialization replacement = materialization(connection, profile);
+    AnalyzerEntry twin = registry.indistinguishableFrom(replacement.entry());
+    if (twin != null) {
+      String detail =
+        "Connection " +
+        connectionId +
+        " on port " +
+        replacement.entry().getListenerPort() +
+        " cannot be told apart from active connection " +
+        twin.getBridgeConnectionId() +
+        " (" +
+        twin.getName() +
+        "): give each a distinct host, or set senderId to each instrument's system name";
+      if (refuseIndistinguishable) {
+        throw new AnalyzerConnectionException(AnalyzerConnectionException.Kind.CONFLICT, detail);
+      }
+      // Restoring what was already active must not stop the bridge from starting; messages the
+      // pair cannot be told apart for are dead-lettered as AMBIGUOUS_SOURCE instead.
+      log.warn("{}. Restoring it anyway; its unattributable messages will be held as AMBIGUOUS_SOURCE", detail);
+    }
+    ActiveMaterialization previous = activeConnections.get(connectionId);
+    if (previous != null) {
+      deactivateMaterialization(previous);
+      activeConnections.remove(connectionId);
+    }
+
+    try {
+      activateMaterialization(replacement, !refuseIndistinguishable);
+      activeConnections.put(connectionId, replacement);
+    } catch (RuntimeException exception) {
+      if (previous != null) {
+        try {
+          activateMaterialization(previous, true);
+          activeConnections.put(connectionId, previous);
+        } catch (RuntimeException rollbackFailure) {
+          exception.addSuppressed(rollbackFailure);
+        }
+      }
+      throw exception;
+    }
+  }
+
+  @Override
+  public synchronized void deactivate(ObjectNode connection, ObjectNode profile) {
+    String connectionId = requiredText(connection, "connectionId", "Connection ID");
+    ActiveMaterialization active = activeConnections.get(connectionId);
+    if (active != null) {
+      deactivateMaterialization(active);
+      activeConnections.remove(connectionId);
+      return;
+    }
+
+    String analyzerId = requiredText(connection, "clientAnalyzerId", "OpenELIS analyzer ID");
+    ObjectNode values = requiredObject(connection, "values");
+    String protocol = requiredText(profile.path("protocol"), "name", "Profile protocol");
+    deactivateTransport(protocol, connectionId, analyzerId, values);
+    registry.unregister(registryKey(protocol, connectionId, values), analyzerId);
+  }
+
+  /** A FILE directory must lie under the import roots before the connection is saved. */
+  @Override
+  public void validate(ObjectNode values, ObjectNode profile) {
+    if (fileWatcher == null || !"FILE".equals(profile.path("protocol").path("name").asText())) return;
+    if ("HTTP".equals(nullableText(values, "transport"))) return;
+    String directory = nullableText(values, "directory");
+    if (directory == null || directory.isBlank()) return;
+    org.itech.ahb.file.ImportRoots roots = fileWatcher.importRoots();
+    if (roots == null) return;
+    try {
+      roots.require(Path.of(directory));
+    } catch (IOException | java.nio.file.InvalidPathException exception) {
+      throw new AnalyzerConnectionException(exception.getMessage(), exception);
+    }
+  }
+
+  @Override
+  public synchronized void restore(ObjectNode connection, ObjectNode profile) {
+    activate(connection, profile, false);
+  }
+
+  private ActiveMaterialization materialization(ObjectNode connection, ObjectNode profile) {
+    ObjectNode savedConnection = connection.deepCopy();
+    ObjectNode pinnedProfile = profile.deepCopy();
+    String protocol = requiredText(pinnedProfile.path("protocol"), "name", "Profile protocol");
+    String connectionId = requiredText(savedConnection, "connectionId", "Connection ID");
+    String analyzerId = requiredText(savedConnection, "clientAnalyzerId", "OpenELIS analyzer ID");
+    ObjectNode values = requiredObject(savedConnection, "values");
+    return new ActiveMaterialization(
+      savedConnection,
+      pinnedProfile,
+      registryKey(protocol, connectionId, values),
+      materialize(analyzerId, savedConnection, pinnedProfile, values)
+    );
+  }
+
+  private void activateMaterialization(ActiveMaterialization materialization, boolean restoring) {
+    ObjectNode connection = materialization.connection();
+    ObjectNode profile = materialization.profile();
+    String connectionId = requiredText(connection, "connectionId", "Connection ID");
+    String analyzerId = requiredText(connection, "clientAnalyzerId", "OpenELIS analyzer ID");
+    String protocol = requiredText(profile.path("protocol"), "name", "Profile protocol");
+    ObjectNode values = requiredObject(connection, "values");
+    registry.register(materialization.registryKey(), materialization.entry());
+    try {
+      activateTransport(protocol, connectionId, materialization.registryKey(), analyzerId, profile, values, restoring);
+    } catch (RuntimeException exception) {
+      registry.unregister(materialization.registryKey(), analyzerId);
+      throw exception;
+    }
+  }
+
+  private void deactivateMaterialization(ActiveMaterialization materialization) {
+    ObjectNode connection = materialization.connection();
+    ObjectNode profile = materialization.profile();
+    String connectionId = requiredText(connection, "connectionId", "Connection ID");
+    String analyzerId = requiredText(connection, "clientAnalyzerId", "OpenELIS analyzer ID");
+    deactivateTransport(
+      requiredText(profile.path("protocol"), "name", "Profile protocol"),
+      connectionId,
+      analyzerId,
+      requiredObject(connection, "values")
+    );
+    registry.unregister(materialization.registryKey(), analyzerId);
+  }
+
+  private record ActiveMaterialization(
+    ObjectNode connection,
+    ObjectNode profile,
+    String registryKey,
+    AnalyzerEntry entry
+  ) {}
+
+  private void activateTransport(
+    String protocol,
+    String connectionId,
+    String sourceBindingId,
+    String analyzerId,
+    ObjectNode profile,
+    ObjectNode values,
+    boolean restoring
+  ) {
+    if ("HTTP".equals(nullableText(values, "transport"))) {
+      boolean socketProtocol = "ASTM".equals(protocol) || "HL7".equals(protocol);
+      boolean tabularProtocol =
+        "FILE".equals(protocol) &&
+        ("CSV".equals(nullableText(values, "fileFormat")) || "TSV".equals(nullableText(values, "fileFormat")));
+      if (!socketProtocol && !tabularProtocol) {
+        throw new AnalyzerConnectionException("HTTP input requires an ASTM, HL7, CSV or TSV profile");
+      }
+      // The shared HTTP controller receives traffic; this connection owns its sender binding.
+      return;
+    }
+    if ("FILE".equals(protocol)) {
+      if (fileWatcher == null) {
+        throw new AnalyzerConnectionException("FILE runtime is disabled in this Bridge deployment");
+      }
+      Path directory = Path.of(requiredText(values, "directory", "FILE directory")).normalize();
+      String filePattern = requiredText(values, "filePattern", "FILE pattern");
+      try {
+        fileWatcher.addWatchDirectory(directory, filePattern, analyzerId);
+      } catch (IOException exception) {
+        throw new AnalyzerConnectionException("Cannot activate FILE watch for " + analyzerId, exception);
+      }
+      return;
+    }
+
+    if ("ASTM".equals(protocol) && "TCP/IP".equals(nullableText(values, "transport"))) {
+      if ("SERVER".equals(nullableText(values, "connectionRole"))) {
+        astmListeners.start(
+          connectionId,
+          analyzerId,
+          listenerPorts.forProfile(profile),
+          requiredText(profile.path("protocol"), "lowerLayerVersion", "ASTM lower-layer version")
+        );
+      }
+      return;
+    }
+
+    if ("HL7".equals(protocol) && isTcpTransport(protocol, values)) {
+      // CLIENT opens a fresh outbound MLLP session per order; it owns no incoming listener.
+      if ("CLIENT".equals(nullableText(values, "connectionRole"))) {
+        if (!AnalyzerOutboundEndpoint.ordersEnabled(profile, values)) {
+          throw new AnalyzerConnectionException(
+            "HL7 CLIENT requires enabled outbound orders; persistent client-side result reception is not implemented"
+          );
+        }
+        return;
+      }
+      if (hl7Listeners == null) throw new AnalyzerConnectionException("HL7 listener runtime is unavailable");
+      hl7Listeners.start(connectionId, listenerPorts.forProfile(profile));
+      return;
+    }
+
+    if ("RS-232".equals(nullableText(values, "transport"))) {
+      if (serialListeners == null) {
+        throw new AnalyzerConnectionException("Serial runtime is unavailable in this Bridge deployment");
+      }
+      String path = requiredText(values, "serialPort", "Serial port");
+      SerialConnectionSettings settings = SerialConnectionSettings.fromProfile(profile);
+      if (restoring) {
+        serialListeners.restore(connectionId, sourceBindingId, analyzerId, path, settings);
+      } else {
+        serialListeners.start(connectionId, sourceBindingId, analyzerId, path, settings);
+      }
+      return;
+    }
+
+    throw new AnalyzerConnectionException(
+      "Runtime activation is not implemented for the saved " + protocol + " transport"
+    );
+  }
+
+  private void deactivateTransport(String protocol, String connectionId, String analyzerId, ObjectNode values) {
+    if ("HTTP".equals(nullableText(values, "transport"))) {
+      return;
+    }
+    if ("FILE".equals(protocol)) {
+      if (fileWatcher != null) {
+        Path directory = Path.of(requiredText(values, "directory", "FILE directory")).normalize();
+        fileWatcher.removeWatchRegistration(directory, analyzerId);
+      }
+    } else if ("RS-232".equals(nullableText(values, "transport"))) {
+      if (serialListeners != null) {
+        serialListeners.stop(connectionId);
+      }
+    } else if (
+      "ASTM".equals(protocol) &&
+      "TCP/IP".equals(nullableText(values, "transport")) &&
+      "SERVER".equals(nullableText(values, "connectionRole"))
+    ) {
+      astmListeners.stop(connectionId);
+    } else if (
+      "HL7".equals(protocol) &&
+      isTcpTransport(protocol, values) &&
+      "SERVER".equals(nullableText(values, "connectionRole"))
+    ) {
+      if (hl7Listeners != null) hl7Listeners.stop(connectionId);
+    }
+  }
+
+  private static boolean isTcpTransport(String protocol, ObjectNode values) {
+    String transport = nullableText(values, "transport");
+    return "TCP/IP".equals(transport) || ("HL7".equals(protocol) && "MLLP".equals(transport));
+  }
+
+  private static String registryKey(String protocol, String connectionId, ObjectNode values) {
+    if ("FILE".equals(protocol) && !"HTTP".equals(nullableText(values, "transport"))) {
+      return Path.of(requiredText(values, "directory", "FILE directory")).normalize() + "#" + connectionId;
+    }
+    return "connection:" + connectionId;
+  }
+
+  private AnalyzerEntry materialize(String analyzerId, ObjectNode connection, ObjectNode profile, ObjectNode values) {
+    AnalyzerEntry entry = new AnalyzerEntry();
+    entry.setId(analyzerId);
+    entry.setReceptionPurpose(connection.path("receptionPurpose").asText("ROUTINE"));
+    entry.setBridgeConnectionId(requiredText(connection, "connectionId", "Connection ID"));
+    entry.setProfileId(requiredText(connection.path("profileRef"), "profileId", "Profile ID"));
+    entry.setProfileRevision(requiredRevision(connection.path("profileRef"), "revision", "Profile revision"));
+    entry.setProfileFingerprint(requiredText(profile.path("catalog"), "revisionFingerprint", "Profile fingerprint"));
+    entry.setName(requiredText(connection, "displayName", "Connection name"));
+    entry.setExpectedProtocol(requiredText(profile.path("protocol"), "name", "Profile protocol"));
+    entry.setInboundTransport(nullableText(values, "transport"));
+    entry.setOutboundOrdersSupported(AnalyzerOutboundEndpoint.ordersEnabled(profile, values));
+    if ("HTTP".equals(entry.getInboundTransport())) {
+      String sourceAddress = IpLiteral.canonicalize(requiredText(values, "host", "HTTP analyzer IP address"));
+      if (sourceAddress == null) {
+        throw new AnalyzerConnectionException("HTTP analyzer host must be a literal IP address");
+      }
+      entry.setInboundSourceId(sourceAddress);
+    } else if (
+      isTcpTransport(entry.getExpectedProtocol(), values) && "CLIENT".equals(nullableText(values, "connectionRole"))
+    ) {
+      entry.setInboundSourceId(requiredText(values, "host", "Analyzer host"));
+    } else if (
+      isTcpTransport(entry.getExpectedProtocol(), values) &&
+      "SERVER".equals(nullableText(values, "connectionRole")) &&
+      ("ASTM".equals(entry.getExpectedProtocol()) || "HL7".equals(entry.getExpectedProtocol()))
+    ) {
+      // The analyzer connects to a shared listener; its connection is resolved per message.
+      entry.setListenerPort(listenerPorts.forProfile(profile));
+      String host = nullableText(values, "host");
+      if (host != null) {
+        String address = IpLiteral.canonicalize(host);
+        entry.setInboundSourceId(address != null ? address : host.trim());
+        // A hostname is kept as entered and never resolved: sender identity is numeric only.
+        entry.setInboundAddress(address);
+      }
+      String senderId = nullableText(values, "senderId");
+      entry.setSenderId(senderId == null ? null : senderId.trim());
+    }
+    entry.setOutboundHost(nullableText(values, "host"));
+    entry.setOutboundPort(
+      AnalyzerOutboundEndpoint.needed(profile, values) ? outboundEndpoint.resolvePort(profile, values).port() : 0
+    );
+    entry.setIdentifierPattern(nullableText(profile, "identifier_pattern"));
+    entry.setFilePattern(nullableText(values, "filePattern"));
+    entry.setColumnMappings(textMap(profile.path("column_mapping")));
+    entry.setTestCodeValues(textMap(profile.path("test_code_values")));
+    entry.setFileFormat(nullableText(values, "fileFormat"));
+    // Whitespace is meaningful for a delimiter (notably a TSV tab).
+    entry.setDelimiter(values.path("delimiter").isTextual() ? values.path("delimiter").asText() : null);
+    entry.setSkipRows(values.path("skipRows").asInt(0));
+    if ("ASTM".equals(entry.getExpectedProtocol())) {
+      entry.setAstmResultRecordSelection(AstmResultRecordSelection.fromProfile(profile.path("configDefaults")));
+    } else if ("HL7".equals(entry.getExpectedProtocol())) {
+      entry.setHl7SpecimenPosition(
+        org.itech.ahb.profile.Hl7SpecimenPosition.fromProfile(profile.path("configDefaults"))
+      );
+      entry.setHl7ResultRecordSelection(
+        org.itech.ahb.profile.Hl7ResultRecordSelection.fromProfile(profile.path("configDefaults"))
+      );
+    } else if ("FILE".equals(entry.getExpectedProtocol())) {
+      if (!"HTTP".equals(entry.getInboundTransport())) {
+        entry.setFileDirectory(Path.of(requiredText(values, "directory", "FILE directory")).normalize().toString());
+      }
+      entry.setTabularFileLayout(tabularFileLayout(profile));
+      entry.setTabularResultValueSelection(TabularResultValueSelection.fromProfile(profile));
+    }
+
+    Map<String, String> codeOverrides = codeOverrides(profile, values);
+    // Every protocol translates an instrument's own code back to the profile's; an ASTM or HL7
+    // profile also declares where each part of a record sits.
+    entry.setResultReading(org.itech.ahb.profile.ResultReading.fromProfile(profile, values));
+    List<String> primaryCodes = new ArrayList<>();
+    Map<String, String> codeToLoinc = new LinkedHashMap<>();
+    for (JsonNode mapping : profile.path("default_test_mappings")) {
+      String code = requiredText(mapping, "test_code", "Profile test code");
+      String loinc = TestCodings.loinc(mapping);
+      primaryCodes.add(code);
+      List<String> aliases = new ArrayList<>();
+      // The instrument sends the code this connection set for the assay, else the profile's.
+      aliases.add(codeOverrides.getOrDefault(code, code));
+      mapping.path("aliases").forEach(alias -> aliases.add(alias.asText()));
+      if (loinc != null) {
+        aliases.forEach(alias -> codeToLoinc.put(alias, loinc));
+      }
+    }
+    entry.setCodeToLoinc(codeToLoinc);
+    entry.setFileTestCode(
+      fileTestCode(
+        entry.getExpectedProtocol(),
+        primaryCodes,
+        entry.getColumnMappings(),
+        nullableText(values, "fileTestCode")
+      )
+    );
+    entry.setControlResultRecognition(ControlResultRecognition.fromProfile(profile.path("controlResultRecognition")));
+    entry.setRecognitionFingerprint(
+      requiredText(profile.path("catalog"), "recognitionFingerprint", "Recognition fingerprint")
+    );
+    return entry;
+  }
+
+  private static int requiredRevision(JsonNode node, String field, String label) {
+    JsonNode value = node.path(field);
+    if (!value.isIntegralNumber() || value.asInt() < 1) {
+      throw new AnalyzerConnectionException(label + " is required");
+    }
+    return value.asInt();
+  }
+
+  private static String fileTestCode(
+    String protocol,
+    List<String> primaryCodes,
+    Map<String, String> columns,
+    String selectedTestCode
+  ) {
+    if (!"FILE".equals(protocol)) {
+      return null;
+    }
+    if (selectedTestCode != null) {
+      if (!primaryCodes.contains(selectedTestCode)) throw new AnalyzerConnectionException(
+        "fileTestCode must identify a primary test in the pinned profile"
+      );
+      return selectedTestCode;
+    }
+    if (primaryCodes.size() == 1) {
+      return primaryCodes.get(0);
+    }
+    if (columns.containsValue("testCode")) {
+      return null;
+    }
+    throw new AnalyzerConnectionException(
+      "FILE profile must declare a row-level testCode column, a selected fileTestCode, or one primary test mapping"
+    );
+  }
+
+  private static TabularFileLayout tabularFileLayout(JsonNode profile) {
+    JsonNode detection = profile.path("sheet_detection");
+    if (!detection.isObject()) {
+      return null;
+    }
+    List<String> preferredSheetNames = new ArrayList<>();
+    detection.path("preferred_sheet_names").forEach(name -> preferredSheetNames.add(name.asText()));
+    return TabularFileLayout.headerScan(
+      preferredSheetNames,
+      detection.path("header_marker").asText(),
+      detection.path("max_sheets_to_scan").asInt(),
+      detection.path("max_rows_to_scan").asInt()
+    );
+  }
+
+  private static Map<String, String> textMap(JsonNode value) {
+    if (!value.isObject()) {
+      return Map.of();
+    }
+    Map<String, String> result = new LinkedHashMap<>();
+    value.fields().forEachRemaining(entry -> result.put(entry.getKey(), entry.getValue().asText()));
+    return result;
+  }
+
+  private static ObjectNode requiredObject(JsonNode value, String field) {
+    JsonNode child = value.path(field);
+    if (!(child instanceof ObjectNode object)) {
+      throw new AnalyzerConnectionException(field + " must be an object");
+    }
+    return object;
+  }
+
+  private static String requiredText(JsonNode value, String field, String label) {
+    String result = nullableText(value, field);
+    if (result == null) {
+      throw new AnalyzerConnectionException(label + " is required");
+    }
+    return result;
+  }
+
+  /**
+   * The instrument codes this connection sets for the profile's assays, by profile code. Each must
+   * belong to a test the pinned profile declares, and no two assays may share a code, including a
+   * code or alias the profile already gives another assay.
+   */
+  static Map<String, String> codeOverrides(JsonNode profile, JsonNode values) {
+    Set<String> declared = new LinkedHashSet<>();
+    Map<String, String> declaredOwners = new LinkedHashMap<>();
+    profile
+      .path("default_test_mappings")
+      .forEach(mapping -> {
+        String code = mapping.path("test_code").asText();
+        declared.add(code);
+        declaredOwners.put(code, code);
+        mapping.path("aliases").forEach(alias -> declaredOwners.put(alias.asText(), code));
+      });
+    Map<String, String> overrides = new LinkedHashMap<>();
+    Map<String, String> owners = new LinkedHashMap<>();
+    JsonNode configured = values.path("codeOverrides");
+    if (configured.isMissingNode() || configured.isNull()) {
+      return overrides;
+    }
+    if (!configured.isObject()) {
+      throw new AnalyzerConnectionException("codeOverrides must map profile test codes to instrument codes");
+    }
+    configured
+      .fields()
+      .forEachRemaining(entry -> {
+        if (!declared.contains(entry.getKey())) {
+          throw new AnalyzerConnectionException(
+            "codeOverrides names a code the pinned profile does not declare: " + entry.getKey()
+          );
+        }
+        if (!entry.getValue().isTextual() || entry.getValue().asText().isBlank()) {
+          throw new AnalyzerConnectionException("codeOverrides needs an instrument code for " + entry.getKey());
+        }
+        String instrumentCode = entry.getValue().asText().trim();
+        String declaredOwner = declaredOwners.get(instrumentCode);
+        if (declaredOwner != null && !declaredOwner.equals(entry.getKey())) {
+          throw new AnalyzerConnectionException(
+            "codeOverrides gives " +
+            entry.getKey() +
+            " the code " +
+            instrumentCode +
+            ", which the profile uses for " +
+            declaredOwner
+          );
+        }
+        String previous = owners.putIfAbsent(instrumentCode, entry.getKey());
+        if (previous != null) {
+          throw new AnalyzerConnectionException(
+            "codeOverrides gives " + instrumentCode + " to both " + previous + " and " + entry.getKey()
+          );
+        }
+        overrides.put(entry.getKey(), instrumentCode);
+      });
+    return overrides;
+  }
+
+  private static String nullableText(JsonNode value, String field) {
+    JsonNode child = value.path(field);
+    return child.isTextual() && !child.asText().isBlank() ? child.asText() : null;
+  }
+}

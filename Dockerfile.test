@@ -1,0 +1,26 @@
+# Dockerfile for running serial integration tests
+FROM eclipse-temurin:21-jdk
+
+# Install Maven and socat (for virtual serial ports)
+RUN apt-get update && apt-get install -y maven socat && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy pom files first for better layer caching
+COPY pom.xml .
+COPY astm-http-lib/pom.xml astm-http-lib/
+
+# Download dependencies
+RUN mvn dependency:go-offline -DskipTests
+
+# Copy source code
+COPY src src/
+COPY contracts contracts/
+COPY astm-http-lib/src astm-http-lib/src/
+
+# Copy serial test entrypoint
+COPY scripts/docker-serial-test-entrypoint.sh /app/run-serial-tests.sh
+RUN chmod +x /app/run-serial-tests.sh
+
+# Default command runs the serial integration tests
+CMD ["mvn", "test", "-Dtest=SerialIntegrationTest", "-DfailIfNoTests=false"]

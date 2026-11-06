@@ -1,0 +1,14 @@
+# Docker Compose for Serial Port Integration Tests
+#
+# Runs SerialIntegrationTest with socat virtual serial ports inside a single container.
+# The test is self-contained: embedded HTTP server, serial listener, and data sender.
+#
+# Usage:
+#   docker compose -f docker-compose-serial-test.yml run --rm serial-test-runner
+
+services:
+  serial-test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["/bin/bash", "/app/run-serial-tests.sh"]

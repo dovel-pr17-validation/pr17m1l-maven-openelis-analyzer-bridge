@@ -1,0 +1,764 @@
+package org.itech.ahb.fhir;
+
+import ca.uhn.fhir.context.FhirContext;
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Objects;
+import java.util.UUID;
+import lombok.extern.slf4j.Slf4j;
+import org.hl7.fhir.r4.model.Bundle;
+import org.hl7.fhir.r4.model.CodeableConcept;
+import org.hl7.fhir.r4.model.Coding;
+import org.hl7.fhir.r4.model.Device;
+import org.hl7.fhir.r4.model.DiagnosticReport;
+import org.hl7.fhir.r4.model.Observation;
+import org.hl7.fhir.r4.model.Patient;
+import org.hl7.fhir.r4.model.Quantity;
+import org.hl7.fhir.r4.model.Reference;
+import org.hl7.fhir.r4.model.Specimen;
+import org.hl7.fhir.r4.model.StringType;
+import org.itech.ahb.profile.ControlResultRecognition;
+
+/**
+ * Builds FHIR R4 transaction Bundles from parsed analyzer results.
+ *
+ * <p>Used by the bridge to normalize all analyzer protocols (HL7 v2, ASTM,
+ * Excel, CSV) into a standard FHIR payload before forwarding to OE.
+ *
+ * <p>Bundle structure:
+ * <ul>
+ *   <li>One Specimen per accession number (carries the sample ID)</li>
+ *   <li>One Observation per test result (references the Specimen)</li>
+ *   <li>One DiagnosticReport grouping all Observations</li>
+ * </ul>
+ */
+@Slf4j
+public class FhirBundleBuilder {
+
+  private static final FhirContext CTX = FhirContext.forR4();
+  private static final String NORMALIZED_BUNDLE_PROFILE =
+    "https://openelis-global.org/fhir/StructureDefinition/analyzer-normalized-bundle-v1";
+  private static final String MESSAGE_ID_SYSTEM = "https://openelis-global.org/fhir/analyzer-message-id";
+  private static final String CONNECTION_ID_SYSTEM = "https://openelis-global.org/fhir/analyzer-connection-id";
+  private static final String ANALYZER_ID_SYSTEM = "https://openelis-global.org/fhir/analyzer-id";
+  private static final String RAW_CODE_SYSTEM = "https://openelis-global.org/fhir/CodeSystem/analyzer-raw-code";
+  private static final String EXTENSION_ROOT = "https://openelis-global.org/fhir/StructureDefinition/";
+
+  /**
+   * Build the versioned Bridge-to-OpenELIS result contract while preserving analyzer-native identity
+   * and optional terminology hints independently.
+   *
+   * <p>The delivery identity is supplied by the caller and must be derived from the received content
+   * (see {@code DeliveryIdentity}), never minted here. OpenELIS deduplicates on this value, so a
+   * bundle rebuilt for a retry has to carry the identity the first attempt used.
+   */
+  public static String buildNormalizedBundle(
+    String accessionNumber,
+    List<AnalyzerResult> results,
+    AnalyzerContext context,
+    java.util.function.Function<String, String> codeToLoinc,
+    String messageId
+  ) {
+    return CTX.newJsonParser()
+      .setPrettyPrint(false)
+      .encodeResourceToString(normalizedBundle(accessionNumber, results, context, codeToLoinc, messageId));
+  }
+
+  /**
+   * Build the normalized bundle for a parsed message, with every part the instrument reported in
+   * its FHIR slot: the records' parts, the warnings it raised about the sample, the patient the
+   * instrument named and the specimen descriptor it sent.
+   */
+  public static String buildNormalizedBundle(
+    HL7ResultParser.ParsedResults parsed,
+    AnalyzerContext context,
+    java.util.function.Function<String, String> codeToLoinc,
+    String messageId
+  ) {
+    return buildNormalizedBundle(parsed, context, codeToLoinc, messageId, "ROUTINE");
+  }
+
+  /** Version 1.2 retains receipt-time purpose independently of the current runtime. */
+  public static String buildNormalizedBundle(
+    HL7ResultParser.ParsedResults parsed,
+    AnalyzerContext context,
+    java.util.function.Function<String, String> codeToLoinc,
+    String messageId,
+    String receptionPurpose
+  ) {
+    if (!"SETUP".equals(receptionPurpose) && !"ROUTINE".equals(receptionPurpose)) {
+      throw new IllegalArgumentException("Receipt purpose must be SETUP or ROUTINE");
+    }
+    Bundle bundle = normalizedBundle(parsed.accessionNumber(), parsed.results(), context, codeToLoinc, messageId);
+    Device device = bundle
+      .getEntry()
+      .stream()
+      .map(Bundle.BundleEntryComponent::getResource)
+      .filter(Device.class::isInstance)
+      .map(Device.class::cast)
+      .findFirst()
+      .orElseThrow();
+    device.getExtensionByUrl(EXTENSION_ROOT + "analyzer-contract-version").setValue(new StringType("1.2"));
+    device.addExtension(
+      EXTENSION_ROOT + "analyzer-delivery-purpose",
+      new org.hl7.fhir.r4.model.CodeType(receptionPurpose)
+    );
+    addSampleFlags(bundle, parsed.sampleFlags(), context);
+    addInstrumentContext(bundle, parsed);
+    return CTX.newJsonParser().setPrettyPrint(false).encodeResourceToString(bundle);
+  }
+
+  private static Bundle normalizedBundle(
+    String accessionNumber,
+    List<AnalyzerResult> results,
+    AnalyzerContext context,
+    java.util.function.Function<String, String> codeToLoinc,
+    String messageId
+  ) {
+    Objects.requireNonNull(context, "analyzer context is required");
+    if (messageId == null || messageId.isBlank()) {
+      throw new IllegalArgumentException("messageId is required");
+    }
+    String json = buildBaseBundle(accessionNumber, results, context.deviceInfo());
+    Bundle bundle = CTX.newJsonParser().parseResource(Bundle.class, json);
+    bundle.getMeta().addProfile(NORMALIZED_BUNDLE_PROFILE);
+    bundle.getIdentifier().setSystem(MESSAGE_ID_SYSTEM).setValue(messageId);
+
+    Device device = bundle
+      .getEntry()
+      .stream()
+      .map(Bundle.BundleEntryComponent::getResource)
+      .filter(Device.class::isInstance)
+      .map(Device.class::cast)
+      .findFirst()
+      .orElseThrow(() -> new IllegalStateException("Analyzer source context is required"));
+    device.addIdentifier().setSystem(CONNECTION_ID_SYSTEM).setValue(context.bridgeConnectionId());
+    device.addIdentifier().setSystem(ANALYZER_ID_SYSTEM).setValue(context.clientAnalyzerId());
+    device.addExtension(EXTENSION_ROOT + "analyzer-contract-version", new StringType("1.1"));
+    device.addExtension(EXTENSION_ROOT + "analyzer-profile-id", new StringType(context.profileId()));
+    device.addExtension(
+      EXTENSION_ROOT + "analyzer-profile-revision",
+      new org.hl7.fhir.r4.model.IntegerType(context.profileRevision())
+    );
+    if (context.profileFingerprint() != null) {
+      // Provenance only: consumers do not reconstruct parsing from this fingerprint.
+      device.addExtension(
+        EXTENSION_ROOT + "analyzer-profile-fingerprint",
+        new StringType(context.profileFingerprint())
+      );
+    }
+    device.addExtension(
+      EXTENSION_ROOT + "analyzer-source-protocol",
+      new org.hl7.fhir.r4.model.CodeType(context.sourceProtocol())
+    );
+
+    List<Observation> observations = bundle
+      .getEntry()
+      .stream()
+      .map(Bundle.BundleEntryComponent::getResource)
+      .filter(Observation.class::isInstance)
+      .map(Observation.class::cast)
+      .toList();
+    if (observations.size() != results.size()) {
+      throw new IllegalStateException("Every parsed result must produce one Observation");
+    }
+    for (int index = 0; index < results.size(); index++) {
+      AnalyzerResult result = results.get(index);
+      Observation observation = observations.get(index);
+      String loinc = codeToLoinc == null ? null : codeToLoinc.apply(result.testCode());
+      if (loinc != null && !loinc.isBlank()) {
+        observation.getCode().addCoding(new Coding("http://loinc.org", loinc, result.testName()));
+      }
+      observation.addExtension(EXTENSION_ROOT + "analyzer-raw-value", new StringType(result.value()));
+      observation.addExtension(
+        EXTENSION_ROOT + "analyzer-source-transport",
+        new org.hl7.fhir.r4.model.CodeType(context.sourceTransport())
+      );
+      observation.addExtension(
+        EXTENSION_ROOT + "analyzer-result-classification",
+        new org.hl7.fhir.r4.model.CodeType(result.isControl() ? "CONTROL" : "PATIENT")
+      );
+      observation.addExtension(controlRecognitionExtension(context, result));
+      // The instrument's own status replaces this when it reported one.
+      observation.setStatus(Observation.ObservationStatus.UNKNOWN);
+      if (result.parts() != null) {
+        RecordSlots.apply(observation, result);
+      }
+      NormalizedAnswer.apply(observation, result, context.reading());
+    }
+    return bundle;
+  }
+
+  /**
+   * Each warning the instrument raised about the sample as an Observation of its own, classified
+   * {@code SAMPLE_FLAG}: present, under the code and name the instrument sent, and never a result.
+   */
+  private static void addSampleFlags(Bundle bundle, List<SampleFlag> flags, AnalyzerContext context) {
+    if (flags.isEmpty()) {
+      return;
+    }
+    String specimenUrl = fullUrlOf(bundle, Specimen.class);
+    String deviceUrl = fullUrlOf(bundle, Device.class);
+    DiagnosticReport report = bundle
+      .getEntry()
+      .stream()
+      .map(Bundle.BundleEntryComponent::getResource)
+      .filter(DiagnosticReport.class::isInstance)
+      .map(DiagnosticReport.class::cast)
+      .findFirst()
+      .orElseThrow(() -> new IllegalStateException("The bundle groups its observations in a report"));
+    for (SampleFlag flag : flags) {
+      Observation observation = new Observation();
+      observation.setStatus(Observation.ObservationStatus.UNKNOWN);
+      observation.addCategory(
+        new CodeableConcept()
+          .addCoding(
+            new Coding("http://terminology.hl7.org/CodeSystem/observation-category", "laboratory", "Laboratory")
+          )
+      );
+      observation.setCode(new CodeableConcept().addCoding(new Coding(RAW_CODE_SYSTEM, flag.code(), flag.name())));
+      observation.setValue(new org.hl7.fhir.r4.model.BooleanType(true));
+      observation.setSpecimen(new Reference(specimenUrl));
+      observation.setDevice(new Reference(deviceUrl));
+      observation.addExtension(EXTENSION_ROOT + "analyzer-raw-value", new StringType(flag.value()));
+      observation.addExtension(
+        EXTENSION_ROOT + "analyzer-source-transport",
+        new org.hl7.fhir.r4.model.CodeType(context.sourceTransport())
+      );
+      observation.addExtension(
+        EXTENSION_ROOT + "analyzer-result-classification",
+        new org.hl7.fhir.r4.model.CodeType("SAMPLE_FLAG")
+      );
+      String url = "urn:uuid:" + UUID.randomUUID();
+      addEntry(bundle, url, observation, "Observation");
+      report.addResult(new Reference(url));
+    }
+  }
+
+  private static String fullUrlOf(Bundle bundle, Class<? extends org.hl7.fhir.r4.model.Resource> type) {
+    return bundle
+      .getEntry()
+      .stream()
+      .filter(entry -> type.isInstance(entry.getResource()))
+      .map(Bundle.BundleEntryComponent::getFullUrl)
+      .findFirst()
+      .orElseThrow(() -> new IllegalStateException("The bundle has no " + type.getSimpleName()));
+  }
+
+  /** The patient the instrument named and its specimen descriptor, each as reported. */
+  private static void addInstrumentContext(Bundle bundle, HL7ResultParser.ParsedResults parsed) {
+    if (parsed.specimenDescriptor() != null) {
+      bundle
+        .getEntry()
+        .stream()
+        .map(Bundle.BundleEntryComponent::getResource)
+        .filter(Specimen.class::isInstance)
+        .map(Specimen.class::cast)
+        .findFirst()
+        .ifPresent(specimen -> specimen.getType().setText(parsed.specimenDescriptor()));
+    }
+    InstrumentPatient reported = parsed.patient();
+    if (reported == null) {
+      return;
+    }
+    Patient patient = new Patient();
+    patient.addExtension(EXTENSION_ROOT + "analyzer-patient-source", new org.hl7.fhir.r4.model.CodeType("instrument"));
+    if (reported.identifier() != null) {
+      patient.addIdentifier().setValue(reported.identifier());
+    }
+    if (reported.family() != null || reported.given() != null) {
+      org.hl7.fhir.r4.model.HumanName name = patient.addName();
+      name.setFamily(reported.family());
+      if (reported.given() != null) {
+        name.addGiven(reported.given());
+      }
+    }
+    String patientUrl = "urn:uuid:" + UUID.randomUUID();
+    addEntry(bundle, patientUrl, patient, "Patient");
+    bundle
+      .getEntry()
+      .stream()
+      .map(Bundle.BundleEntryComponent::getResource)
+      .filter(Observation.class::isInstance)
+      .map(Observation.class::cast)
+      .forEach(observation -> observation.setSubject(new Reference(patientUrl)));
+  }
+
+  private static org.hl7.fhir.r4.model.Extension controlRecognitionExtension(
+    AnalyzerContext context,
+    AnalyzerResult result
+  ) {
+    org.hl7.fhir.r4.model.Extension recognition = new org.hl7.fhir.r4.model.Extension(
+      EXTENSION_ROOT + "analyzer-control-recognition"
+    );
+    recognition.addExtension("mode", new org.hl7.fhir.r4.model.CodeType(context.controlRecognition().mode().name()));
+    recognition.addExtension("recognitionFingerprint", new StringType(context.recognitionFingerprint()));
+    if (context.controlRecognition().mode() == ControlResultRecognition.Mode.NONE) {
+      recognition.addExtension("outcome", new org.hl7.fhir.r4.model.CodeType("NOT_EVALUATED"));
+      return recognition;
+    }
+    org.itech.ahb.profile.ControlResultRecognitionEvaluator.Assessment assessment = Objects.requireNonNull(
+      result.controlRecognitionAssessment(),
+      "RULES control recognition requires parser evaluation evidence"
+    );
+    if (
+      assessment.mode() != context.controlRecognition().mode() ||
+      (assessment.outcome() == org.itech.ahb.profile.ControlResultRecognitionEvaluator.Outcome.NOT_EVALUATED) !=
+        context.controlRecognition().rules().isEmpty()
+    ) {
+      throw new IllegalStateException("Parser recognition evidence does not match the pinned profile mode");
+    }
+    boolean matched = assessment.outcome() == org.itech.ahb.profile.ControlResultRecognitionEvaluator.Outcome.MATCH;
+    if (matched != result.isControl()) {
+      throw new IllegalStateException("Result classification does not match parser recognition evidence");
+    }
+    recognition.addExtension("outcome", new org.hl7.fhir.r4.model.CodeType(assessment.outcome().name()));
+    for (org.itech.ahb.profile.ControlResultRecognitionEvaluator.RuleEvaluation evaluation : assessment.evaluations()) {
+      org.hl7.fhir.r4.model.Extension evidence = new org.hl7.fhir.r4.model.Extension("evaluation");
+      evidence.addExtension("ruleKey", new StringType(evaluation.rule().key()));
+      evidence.addExtension("matched", new org.hl7.fhir.r4.model.BooleanType(evaluation.matched()));
+      evidence.addExtension("sourceField", new StringType(evaluation.sourceField()));
+      boolean sourcePresent = !evaluation.rawValue().isBlank();
+      evidence.addExtension("sourcePresent", new org.hl7.fhir.r4.model.BooleanType(sourcePresent));
+      if (sourcePresent) {
+        evidence.addExtension("rawValue", new StringType(evaluation.rawValue()));
+      }
+      recognition.addExtension(evidence);
+    }
+    return recognition;
+  }
+
+  private static String buildBaseBundle(String accessionNumber, List<AnalyzerResult> results, DeviceInfo deviceInfo) {
+    Bundle bundle = new Bundle();
+    bundle.setType(Bundle.BundleType.TRANSACTION);
+
+    String deviceUrl = "urn:uuid:" + UUID.randomUUID();
+    Device device = buildDevice(deviceInfo);
+    addEntry(bundle, deviceUrl, device, "Device");
+
+    // Specimen — carries the accession number
+    String specimenUrl = "urn:uuid:" + UUID.randomUUID();
+    Specimen specimen = new Specimen();
+    specimen.addIdentifier().setValue(accessionNumber);
+    addEntry(bundle, specimenUrl, specimen, "Specimen");
+
+    // DiagnosticReport — groups all observations
+    String reportUrl = "urn:uuid:" + UUID.randomUUID();
+    DiagnosticReport report = new DiagnosticReport();
+    report.setStatus(DiagnosticReport.DiagnosticReportStatus.PRELIMINARY);
+    report.addCategory(
+      new CodeableConcept().addCoding(new Coding("http://terminology.hl7.org/CodeSystem/v2-0074", "LAB", "Laboratory"))
+    );
+    report.setCode(new CodeableConcept().setText("Analyzer Results"));
+    report.addSpecimen(new Reference(specimenUrl));
+
+    // Observations — one per test result
+    for (AnalyzerResult result : results) {
+      String obsUrl = "urn:uuid:" + UUID.randomUUID();
+
+      Observation obs = new Observation();
+      obs.setStatus(Observation.ObservationStatus.PRELIMINARY);
+      obs.addCategory(
+        new CodeableConcept()
+          .addCoding(
+            new Coding("http://terminology.hl7.org/CodeSystem/observation-category", "laboratory", "Laboratory")
+          )
+      );
+      obs.setCode(new CodeableConcept().addCoding(new Coding(RAW_CODE_SYSTEM, result.testCode(), result.testName())));
+      obs.setSpecimen(new Reference(specimenUrl));
+      obs.setDevice(new Reference(deviceUrl));
+
+      // Set value based on type; a record with parts says its own value in its slots.
+      if (result.parts() != null) {
+        // see RecordSlots
+      } else if (result.isNumeric()) {
+        Quantity qty = new Quantity();
+        qty.setValue(new BigDecimal(result.value()));
+        if (result.units() != null) {
+          qty.setUnit(result.units());
+        }
+        obs.setValue(qty);
+      } else {
+        obs.setValue(new StringType(result.value()));
+      }
+
+      // QC/control flag — OE uses this to route to QC queue
+      if (result.isControl()) {
+        obs.getMeta().addTag("http://openelis-global.org/fhir/tags", "QC", "Quality Control");
+      }
+      // control-level lets OE match a control lot by (testId, instrumentId,
+      // level) when the control's specimen ID names no lot. It is the
+      // matched recognition rule's optional controlLevel.
+      if (result.controlLevel() != null && !result.controlLevel().isEmpty()) {
+        obs.addExtension(
+          new org.hl7.fhir.r4.model.Extension(
+            "http://openelis-global.org/fhir/qc/control-level",
+            new org.hl7.fhir.r4.model.StringType(result.controlLevel())
+          )
+        );
+      }
+
+      // When the analyzer performed the test; OpenELIS falls back to the import time without it.
+      if (result.timestamp() != null && !result.timestamp().isBlank()) {
+        try {
+          obs.setEffective(new org.hl7.fhir.r4.model.DateTimeType(result.timestamp()));
+        } catch (RuntimeException e) {
+          // An unreadable time from an analyzer or file must not stop the result being delivered.
+          // Debug, not warn: a file import can carry a free-text date column on every row.
+          log.debug(
+            "Result {} has an unreadable test time '{}': {}",
+            result.testCode(),
+            result.timestamp(),
+            e.getMessage()
+          );
+        }
+      }
+
+      addEntry(bundle, obsUrl, obs, "Observation");
+      report.addResult(new Reference(obsUrl));
+    }
+
+    addEntry(bundle, reportUrl, report, "DiagnosticReport");
+
+    return CTX.newJsonParser().setPrettyPrint(false).encodeResourceToString(bundle);
+  }
+
+  private static void addEntry(
+    Bundle bundle,
+    String fullUrl,
+    org.hl7.fhir.r4.model.Resource resource,
+    String resourceType
+  ) {
+    bundle
+      .addEntry()
+      .setFullUrl(fullUrl)
+      .setResource(resource)
+      .getRequest()
+      .setMethod(Bundle.HTTPVerb.POST)
+      .setUrl(resourceType);
+  }
+
+  /**
+   * Build a FHIR R4 {@link Device} resource from parsed identification info.
+   *
+   * <p>Observed source details are retained as evidence only. The durable
+   * Bridge connection identifier added by {@link #buildNormalizedBundle}
+   * remains the sole routing authority.
+   * <ul>
+   *   <li>{@code Device.identifier[].value} — sourceId (e.g. source IP),
+   *       site code (parsed from sender token), and the raw sender token
+   *       itself. OE matches any of them against analyzer identifiers.</li>
+   *   <li>{@code Device.deviceName.name} — model component (e.g. "GeneXpert").
+   *       OE falls back to this for analyzer-by-name match.</li>
+   *   <li>{@code Device.manufacturer} — derived best-effort from sender
+   *       token; OE may use it for profile selection.</li>
+   *   <li>{@code Device.version[].value} — version component when parseable
+   *       (e.g. "6.2"). Operational metadata.</li>
+   * </ul>
+   */
+  private static Device buildDevice(DeviceInfo info) {
+    Device device = new Device();
+
+    // Identifiers — every distinct value gets its own entry. OE walks
+    // them with tryFindAnalyzerByIdentifier(List<String>).
+    if (info.sourceId() != null && !info.sourceId().isBlank()) {
+      device.addIdentifier().setSystem("https://openelis-global.org/fhir/source-ip").setValue(info.sourceId());
+    }
+    if (info.senderToken() != null && !info.senderToken().isBlank()) {
+      device.addIdentifier().setSystem("https://openelis-global.org/fhir/sender-token").setValue(info.senderToken());
+    }
+    if (info.site() != null && !info.site().isBlank()) {
+      device.addIdentifier().setSystem("https://openelis-global.org/fhir/site").setValue(info.site());
+    }
+
+    // Device name — model when parseable
+    if (info.model() != null && !info.model().isBlank()) {
+      Device.DeviceDeviceNameComponent dn = new Device.DeviceDeviceNameComponent();
+      dn.setName(info.model());
+      dn.setType(Device.DeviceNameType.MANUFACTURERNAME);
+      device.addDeviceName(dn);
+    } else if (info.senderToken() != null && !info.senderToken().isBlank()) {
+      // Fall back to the raw sender token if model wasn't isolated
+      Device.DeviceDeviceNameComponent dn = new Device.DeviceDeviceNameComponent();
+      dn.setName(info.senderToken());
+      dn.setType(Device.DeviceNameType.MANUFACTURERNAME);
+      device.addDeviceName(dn);
+    }
+
+    if (info.manufacturer() != null && !info.manufacturer().isBlank()) {
+      device.setManufacturer(info.manufacturer());
+    }
+
+    if (info.version() != null && !info.version().isBlank()) {
+      Device.DeviceVersionComponent v = new Device.DeviceVersionComponent();
+      v.setValue(info.version());
+      device.addVersion(v);
+    }
+
+    return device;
+  }
+
+  /**
+   * Identification info parsed by the bridge from a protocol's sender
+   * field, packaged for inclusion in the FHIR Bundle as a Device resource.
+   *
+   * <p>All fields are nullable; the builder preserves whatever source evidence
+   * is present without using it to resolve a connection.
+   *
+   * @param sourceId    network address of the analyzer (e.g. "10.0.0.42")
+   * @param senderToken raw sender token from the protocol header
+   *                    (e.g. ASTM H-record field 5: "LA2M3^GeneXpert^6.2";
+   *                    HL7 MSH-3: "MINDRAY")
+   * @param site        parsed site code (e.g. "LA2M3"); null if not parseable
+   * @param model       parsed model name (e.g. "GeneXpert"); null if not parseable
+   * @param version     parsed version (e.g. "6.2"); null if not parseable
+   * @param manufacturer best-effort manufacturer name (e.g. "Cepheid"); may be null
+   */
+  public record DeviceInfo(
+    String sourceId,
+    String senderToken,
+    String site,
+    String model,
+    String version,
+    String manufacturer
+  ) {
+    /** Build from just a sourceId + a raw sender token; parses the token as ASTM-style {@code site^model^version}. */
+    public static DeviceInfo fromSenderToken(String sourceId, String senderToken) {
+      String site = null, model = null, version = null;
+      if (senderToken != null && !senderToken.isBlank() && senderToken.contains("^")) {
+        String[] parts = senderToken.split("\\^", -1);
+        if (parts.length >= 1) site = blankToNull(parts[0]);
+        if (parts.length >= 2) model = blankToNull(parts[1]);
+        if (parts.length >= 3) version = blankToNull(parts[2]);
+      } else if (senderToken != null && !senderToken.isBlank()) {
+        // Single-token sender (e.g. "MINDRAY") — treat as model.
+        model = senderToken.trim();
+      }
+      return new DeviceInfo(sourceId, senderToken, site, model, version, null);
+    }
+
+    private static String blankToNull(String s) {
+      return (s == null || s.trim().isEmpty()) ? null : s.trim();
+    }
+  }
+
+  /** Exact saved-connection and source context for one normalized message. */
+  public record AnalyzerContext(
+    String bridgeConnectionId,
+    String clientAnalyzerId,
+    String profileId,
+    int profileRevision,
+    String sourceProtocol,
+    String sourceTransport,
+    DeviceInfo deviceInfo,
+    ControlResultRecognition controlRecognition,
+    String recognitionFingerprint,
+    String profileFingerprint,
+    org.itech.ahb.profile.ResultReading reading
+  ) {
+    public AnalyzerContext(
+      String connection,
+      String analyzer,
+      String profile,
+      int revision,
+      String protocol,
+      String transport,
+      DeviceInfo device,
+      ControlResultRecognition recognition,
+      String recognitionFingerprint,
+      String profileFingerprint
+    ) {
+      this(
+        connection,
+        analyzer,
+        profile,
+        revision,
+        protocol,
+        transport,
+        device,
+        recognition,
+        recognitionFingerprint,
+        profileFingerprint,
+        null
+      );
+    }
+
+    /** A context whose profile content is not stated; the bundle then names no profile fingerprint. */
+    public AnalyzerContext(
+      String bridgeConnectionId,
+      String clientAnalyzerId,
+      String profileId,
+      int profileRevision,
+      String sourceProtocol,
+      String sourceTransport,
+      DeviceInfo deviceInfo,
+      ControlResultRecognition controlRecognition,
+      String recognitionFingerprint
+    ) {
+      this(
+        bridgeConnectionId,
+        clientAnalyzerId,
+        profileId,
+        profileRevision,
+        sourceProtocol,
+        sourceTransport,
+        deviceInfo,
+        controlRecognition,
+        recognitionFingerprint,
+        null
+      );
+    }
+
+    public AnalyzerContext {
+      requireNonBlank(bridgeConnectionId, "Bridge connection ID");
+      requireNonBlank(clientAnalyzerId, "OpenELIS analyzer ID");
+      requireNonBlank(profileId, "Profile ID");
+      if (profileRevision < 1) {
+        throw new IllegalArgumentException("Profile revision is required");
+      }
+      requireNonBlank(sourceProtocol, "Source protocol");
+      requireNonBlank(sourceTransport, "Source transport");
+      Objects.requireNonNull(deviceInfo, "Device source context is required");
+      Objects.requireNonNull(controlRecognition, "Control recognition is required");
+      if (recognitionFingerprint == null || !recognitionFingerprint.matches("^sha256:[0-9a-f]{64}$")) {
+        throw new IllegalArgumentException("Recognition fingerprint is required");
+      }
+      if (profileFingerprint != null && !profileFingerprint.matches("^sha256:[0-9a-f]{64}$")) {
+        throw new IllegalArgumentException("Profile fingerprint must be a sha256 fingerprint");
+      }
+    }
+
+    private static void requireNonBlank(String value, String label) {
+      if (value == null || value.isBlank()) {
+        throw new IllegalArgumentException(label + " is required");
+      }
+    }
+  }
+
+  /**
+   * A single test result from an analyzer, protocol-agnostic.
+   *
+   * For a control result, controlLevel is the matched recognition rule's
+   * optional controlLevel. OE's QCResultProcessingService uses it to match
+   * a control lot by level when the control's specimen ID names no lot.
+   */
+  public record AnalyzerResult(
+    String testCode,
+    String testName,
+    String value,
+    String units,
+    boolean isNumeric,
+    boolean isControl,
+    String timestamp,
+    String controlLevel,
+    org.itech.ahb.profile.ControlResultRecognitionEvaluator.Assessment controlRecognitionAssessment,
+    RecordParts parts
+  ) {
+    /** Selected tabular fields; value interpretation happens after receipt settings are applied. */
+    public static AnalyzerResult tabular(String testCode, String value, String units) {
+      return new AnalyzerResult(testCode, testCode, value, units, false, false, null, null, null, null);
+    }
+
+    public static AnalyzerResult numeric(String testCode, String testName, String value, String units) {
+      return new AnalyzerResult(testCode, testName, value, units, true, false, null, null, null, null);
+    }
+
+    public static AnalyzerResult text(String testCode, String testName, String value) {
+      return new AnalyzerResult(testCode, testName, value, null, false, false, null, null, null, null);
+    }
+
+    public AnalyzerResult withControl(boolean control) {
+      return new AnalyzerResult(
+        testCode,
+        testName,
+        value,
+        units,
+        isNumeric,
+        control,
+        timestamp,
+        controlLevel,
+        controlRecognitionAssessment,
+        parts
+      );
+    }
+
+    public AnalyzerResult withTimestamp(String ts) {
+      return new AnalyzerResult(
+        testCode,
+        testName,
+        value,
+        units,
+        isNumeric,
+        isControl,
+        ts,
+        controlLevel,
+        controlRecognitionAssessment,
+        parts
+      );
+    }
+
+    public AnalyzerResult withControlLevel(String level) {
+      return new AnalyzerResult(
+        testCode,
+        testName,
+        value,
+        units,
+        isNumeric,
+        isControl,
+        timestamp,
+        level,
+        controlRecognitionAssessment,
+        parts
+      );
+    }
+
+    public AnalyzerResult withControlRecognition(
+      org.itech.ahb.profile.ControlResultRecognitionEvaluator.Assessment assessment
+    ) {
+      return new AnalyzerResult(
+        testCode,
+        testName,
+        value,
+        units,
+        isNumeric,
+        isControl,
+        timestamp,
+        controlLevel,
+        assessment,
+        parts
+      );
+    }
+
+    /** The same result under the profile's code for it, whatever code the instrument sent. */
+    public AnalyzerResult withTestCode(String code) {
+      return new AnalyzerResult(
+        code,
+        code,
+        value,
+        units,
+        isNumeric,
+        isControl,
+        timestamp,
+        controlLevel,
+        controlRecognitionAssessment,
+        parts
+      );
+    }
+
+    /** The same result with every part the instrument reported on its record. */
+    public AnalyzerResult withParts(RecordParts recordParts) {
+      return new AnalyzerResult(
+        testCode,
+        testName,
+        value,
+        units,
+        isNumeric,
+        isControl,
+        timestamp,
+        controlLevel,
+        controlRecognitionAssessment,
+        recordParts
+      );
+    }
+  }
+}

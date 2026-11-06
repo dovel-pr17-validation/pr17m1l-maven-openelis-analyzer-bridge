@@ -1,0 +1,956 @@
+package org.itech.ahb.connection;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
+import lombok.extern.slf4j.Slf4j;
+import org.itech.ahb.connection.AnalyzerConnectionException.Kind;
+import org.itech.ahb.profile.AnalyzerProfileCatalog;
+import org.itech.ahb.profile.ProfileFingerprintService;
+
+/** Durable, profile-pinned analyzer connections owned by Bridge. */
+@Slf4j
+public final class AnalyzerConnectionCatalog {
+
+  private static final String SCHEMA_VERSION = "1.0";
+
+  private final Path directory;
+  private final AnalyzerProfileCatalog profiles;
+  private final ObjectMapper objectMapper;
+  private final Clock clock;
+  private final Supplier<UUID> ids;
+  private final AnalyzerConnectionRuntime runtime;
+  private final ProfileFingerprintService fingerprints = new ProfileFingerprintService();
+  private final Map<String, ObjectNode> connections = new HashMap<>();
+  private final Map<String, String> connectionIdByClientAnalyzerId = new HashMap<>();
+  /** Saved connections that could not be loaded, by connection ID, with the reason. */
+  private final Map<String, String> setAside = new TreeMap<>();
+  /** Active connections that did not restore at startup, with the reason; cleared by the next activation. */
+  private final Map<String, String> restoreFailures = new TreeMap<>();
+
+  public AnalyzerConnectionCatalog(
+    Path directory,
+    AnalyzerProfileCatalog profiles,
+    ObjectMapper objectMapper,
+    Clock clock
+  ) {
+    this(directory, profiles, objectMapper, clock, UUID::randomUUID, AnalyzerConnectionRuntime.noOp());
+  }
+
+  AnalyzerConnectionCatalog(
+    Path directory,
+    AnalyzerProfileCatalog profiles,
+    ObjectMapper objectMapper,
+    Clock clock,
+    Supplier<UUID> ids
+  ) {
+    this(directory, profiles, objectMapper, clock, ids, AnalyzerConnectionRuntime.noOp());
+  }
+
+  AnalyzerConnectionCatalog(
+    Path directory,
+    AnalyzerProfileCatalog profiles,
+    ObjectMapper objectMapper,
+    Clock clock,
+    Supplier<UUID> ids,
+    AnalyzerConnectionRuntime runtime
+  ) {
+    this.directory = directory.toAbsolutePath().normalize();
+    this.profiles = profiles;
+    this.objectMapper = objectMapper;
+    this.clock = clock;
+    this.ids = ids;
+    this.runtime = runtime;
+    load();
+    restoreActiveConnections();
+  }
+
+  public synchronized ObjectNode create(ObjectNode request) {
+    requireVersion(request);
+    String requestId = requireText(request, "requestId");
+    String clientAnalyzerId = requireText(request, "clientAnalyzerId");
+    String displayName = requireText(request, "displayName");
+    ObjectNode profileRef = pinOf(requireObject(request, "profileRef"));
+    ObjectNode suppliedValues = requireObject(request, "values");
+    ObjectNode profile = requirePinnedProfile(profileRef);
+    validateValues(profile, suppliedValues);
+
+    String existingId = connectionIdByClientAnalyzerId.get(clientAnalyzerId);
+    if (existingId != null) {
+      ObjectNode existing = connections.get(existingId);
+      if (
+        requestId.equals(existing.path("createRequestId").asText()) ||
+        sameConfiguration(existing, profileRef, displayName, effectiveValues(profile, suppliedValues))
+      ) {
+        return view(existing, profile);
+      }
+      throw new AnalyzerConnectionException(
+        Kind.CONFLICT,
+        "A different Bridge connection already exists for OpenELIS analyzer " + clientAnalyzerId
+      );
+    }
+
+    String connectionId = ids.get().toString();
+    ObjectNode values = effectiveValues(profile, suppliedValues);
+    validateHttpSender(values);
+    runtime.validate(values, profile);
+    ObjectNode record = objectMapper.createObjectNode();
+    record.put("connectionId", connectionId);
+    record.put("clientAnalyzerId", clientAnalyzerId);
+    record.put("createRequestId", requestId);
+    record.put("displayName", displayName);
+    record.set("profileRef", profileRef.deepCopy());
+    record.put("configRevision", 1);
+    record.set("values", values);
+    record.put("configFingerprint", configurationFingerprint(profileRef, displayName, values));
+    record.putNull("latestProbe");
+    record.put("desiredRuntimeState", "INACTIVE");
+    record.put("actualRuntimeState", "INACTIVE");
+    record.putNull("activeRuntimeRef");
+    record.put("runtimeRevision", 1);
+    record.put("runtimeFingerprint", runtimeFingerprint(record, "INACTIVE", 1));
+    record.putObject("runtimeCommandAcks");
+    record.put("updatedAt", clock.instant().toString());
+    persist(record);
+    add(record);
+    return view(record, profile);
+  }
+
+  public synchronized ObjectNode update(ObjectNode request) {
+    requireVersion(request);
+    requireText(request, "requestId");
+    String connectionId = requireText(request, "connectionId");
+    ObjectNode existing = requireRecord(connectionId);
+    int expectedRevision = requirePositiveInteger(request, "expectedConfigRevision");
+    if (existing.path("configRevision").asInt() != expectedRevision) {
+      throw new AnalyzerConnectionException(
+        Kind.CONFLICT,
+        "Expected configuration revision " +
+        expectedRevision +
+        " does not match current revision " +
+        existing.path("configRevision").asInt()
+      );
+    }
+
+    String displayName = requireText(request, "displayName");
+    ObjectNode profileRef = pinOf(requireObject(request, "profileRef"));
+    ObjectNode suppliedValues = requireObject(request, "values");
+    ObjectNode profile = requirePinnedProfile(profileRef);
+    validateValues(profile, suppliedValues);
+    ObjectNode values = effectiveValues(profile, suppliedValues, (ObjectNode) existing.path("values"));
+    validateHttpSender(values);
+    runtime.validate(values, profile);
+    if (sameConfiguration(existing, profileRef, displayName, values)) {
+      return view(existing, profile);
+    }
+
+    ObjectNode changed = existing.deepCopy();
+    // Preserve active values before editing records written before snapshots existed.
+    if (
+      "ACTIVE".equals(existing.path("actualRuntimeState").asText()) &&
+      !existing.path("activeRuntimeConfiguration").isObject() &&
+      activeRuntimeMatchesConfiguration(existing)
+    ) {
+      changed.set("activeRuntimeConfiguration", runtimeConfiguration(existing));
+    }
+    changed.put("displayName", displayName);
+    changed.set("profileRef", profileRef.deepCopy());
+    changed.put("configRevision", expectedRevision + 1);
+    changed.set("values", values);
+    changed.put("configFingerprint", configurationFingerprint(profileRef, displayName, values));
+    changed.put("updatedAt", clock.instant().toString());
+    persist(changed);
+    add(changed);
+    return view(changed, profile);
+  }
+
+  public synchronized ObjectNode require(String connectionId) {
+    ObjectNode record = requireRecord(connectionId);
+    return view(record, pinnedProfile(record).orElse(null));
+  }
+
+  /** Saved FILE ownership includes inactive connections; runtime registration is not ownership. */
+  public synchronized java.util.List<FileDirectoryClaim> fileDirectoryClaims() {
+    var claims = new ArrayList<FileDirectoryClaim>();
+    for (ObjectNode record : connections.values()) {
+      Optional<ObjectNode> pinned = pinnedProfile(record);
+      if (pinned.isEmpty()) continue;
+      ObjectNode profile = pinned.get();
+      JsonNode values = record.path("values");
+      if (
+        !"FILE".equals(profile.path("protocol").path("name").asText()) ||
+        "HTTP".equals(values.path("transport").asText())
+      ) continue;
+      String directory = values.path("directory").asText();
+      if (directory.isBlank()) continue;
+      claims.add(
+        new FileDirectoryClaim(
+          record.path("clientAnalyzerId").asText(),
+          Path.of(directory),
+          values.path("filePattern").asText()
+        )
+      );
+    }
+    return java.util.List.copyOf(claims);
+  }
+
+  public record FileDirectoryClaim(String analyzerId, Path directory, String filePattern) {}
+
+  public synchronized ObjectNode probe(ObjectNode request, AnalyzerConnectionProbe probe) {
+    requireVersion(request);
+    requireText(request, "requestId");
+    String connectionId = requireText(request, "connectionId");
+    ObjectNode record = requireRecord(connectionId);
+    int expectedRevision = requirePositiveInteger(request, "expectedConfigRevision");
+    if (record.path("configRevision").asInt() != expectedRevision) {
+      throw new AnalyzerConnectionException(
+        Kind.CONFLICT,
+        "Expected configuration revision " +
+        expectedRevision +
+        " does not match current revision " +
+        record.path("configRevision").asInt()
+      );
+    }
+
+    ObjectNode profile = requirePinnedProfile((ObjectNode) record.path("profileRef"));
+    ObjectNode result = probe.execute(request, record.deepCopy(), profile);
+    ObjectNode changed = record.deepCopy();
+    ObjectNode summary = objectMapper.createObjectNode();
+    copy(summary, result, "requestId");
+    copy(summary, result, "configRevision");
+    copy(summary, result, "status");
+    copy(summary, result, "completedAt");
+    changed.set("latestProbe", summary);
+    persist(changed);
+    add(changed);
+    return result;
+  }
+
+  public synchronized ObjectNode applyRuntimeCommand(ObjectNode command) {
+    requireVersion(command);
+    String commandId = requireText(command, "commandId");
+    String connectionId = requireText(command, "connectionId");
+    String action = requireText(command, "action");
+    if (!Set.of("ACTIVATE", "START_SETUP", "DEACTIVATE").contains(action)) {
+      throw new AnalyzerConnectionException("action must be ACTIVATE, START_SETUP or DEACTIVATE");
+    }
+
+    ObjectNode record = requireRecord(connectionId);
+    int expectedRevision = requirePositiveInteger(command, "expectedConfigRevision");
+    if (record.path("configRevision").asInt() != expectedRevision) {
+      throw new AnalyzerConnectionException(
+        Kind.CONFLICT,
+        "Expected configuration revision " +
+        expectedRevision +
+        " does not match current revision " +
+        record.path("configRevision").asInt()
+      );
+    }
+    ObjectNode acknowledgements = record.withObject("runtimeCommandAcks");
+    if (acknowledgements.path(commandId) instanceof ObjectNode prior) {
+      return prior.deepCopy();
+    }
+
+    ObjectNode profile = requirePinnedProfile((ObjectNode) record.path("profileRef"));
+    ObjectNode acknowledgement;
+    if (!"DEACTIVATE".equals(action)) {
+      acknowledgement = activate(record, profile, commandId, action);
+    } else {
+      acknowledgement = deactivate(record, profile, commandId);
+    }
+    record.withObject("runtimeCommandAcks").set(commandId, acknowledgement.deepCopy());
+    persist(record);
+    add(record);
+    return acknowledgement;
+  }
+
+  private ObjectNode activate(ObjectNode record, ObjectNode profile, String commandId, String action) {
+    String purpose = "START_SETUP".equals(action) ? "SETUP" : "ROUTINE";
+    ArrayList<String> missing = missingRequiredFields(record, profile);
+    if (!missing.isEmpty()) {
+      ObjectNode acknowledgement = runtimeAcknowledgement(record, commandId, action, "REJECTED");
+      ObjectNode blocker = acknowledgement.withArray("blockers").addObject();
+      blocker.put("key", "missing-required-values");
+      blocker.put("messageKey", "analyzer.connection.readiness.missingRequiredValues");
+      return acknowledgement;
+    }
+    String connectionId = record.path("connectionId").asText();
+    if (
+      "ACTIVE".equals(record.path("actualRuntimeState").asText()) &&
+      activeRuntimeMatchesConfiguration(record) &&
+      purpose.equals(record.path("receptionPurpose").asText("ROUTINE")) &&
+      !restoreFailures.containsKey(connectionId)
+    ) {
+      return runtimeAcknowledgement(record, commandId, action, "ALREADY_APPLIED");
+    }
+
+    ObjectNode activated = record.deepCopy();
+    activated.put("receptionPurpose", purpose);
+    runtime.activate(activated, profile.deepCopy());
+    record.put("receptionPurpose", purpose);
+    restoreFailures.remove(connectionId);
+    int runtimeRevision = record.path("runtimeRevision").asInt(1) + 1;
+    String runtimeFingerprint = runtimeFingerprint(record, "ACTIVE", runtimeRevision);
+    record.put("desiredRuntimeState", "ACTIVE");
+    record.put("actualRuntimeState", "ACTIVE");
+    record.put("runtimeRevision", runtimeRevision);
+    record.put("runtimeFingerprint", runtimeFingerprint);
+    ObjectNode active = record.putObject("activeRuntimeRef");
+    active.put("receptionPurpose", purpose);
+    active.put("connectionId", record.path("connectionId").asText());
+    active.set("profileRef", record.path("profileRef").deepCopy());
+    active.put("configRevision", record.path("configRevision").asInt());
+    active.put("configFingerprint", record.path("configFingerprint").asText());
+    active.put("runtimeRevision", runtimeRevision);
+    active.put("runtimeFingerprint", runtimeFingerprint);
+    record.set("activeRuntimeConfiguration", runtimeConfiguration(record));
+    record.put("updatedAt", clock.instant().toString());
+    return runtimeAcknowledgement(record, commandId, action, "APPLIED");
+  }
+
+  private ObjectNode deactivate(ObjectNode record, ObjectNode profile, String commandId) {
+    if ("INACTIVE".equals(record.path("actualRuntimeState").asText())) {
+      return runtimeAcknowledgement(record, commandId, "DEACTIVATE", "ALREADY_APPLIED");
+    }
+
+    runtime.deactivate(record.deepCopy(), profile.deepCopy());
+    int runtimeRevision = record.path("runtimeRevision").asInt(1) + 1;
+    String runtimeFingerprint = runtimeFingerprint(record, "INACTIVE", runtimeRevision);
+    record.put("desiredRuntimeState", "INACTIVE");
+    record.put("actualRuntimeState", "INACTIVE");
+    record.put("runtimeRevision", runtimeRevision);
+    record.put("runtimeFingerprint", runtimeFingerprint);
+    record.putNull("activeRuntimeRef");
+    record.remove("activeRuntimeConfiguration");
+    record.put("updatedAt", clock.instant().toString());
+    return runtimeAcknowledgement(record, commandId, "DEACTIVATE", "APPLIED");
+  }
+
+  private ObjectNode runtimeAcknowledgement(ObjectNode record, String commandId, String action, String outcome) {
+    ObjectNode acknowledgement = objectMapper.createObjectNode();
+    acknowledgement.put("schemaVersion", SCHEMA_VERSION);
+    acknowledgement.put("commandId", commandId);
+    acknowledgement.put("action", action);
+    acknowledgement.put("outcome", outcome);
+    copy(acknowledgement, record, "connectionId");
+    acknowledgement.set("profileRef", record.path("profileRef").deepCopy());
+    copy(acknowledgement, record, "configRevision");
+    copy(acknowledgement, record, "configFingerprint");
+    copy(acknowledgement, record, "runtimeRevision");
+    copy(acknowledgement, record, "runtimeFingerprint");
+    copy(acknowledgement, record, "desiredRuntimeState");
+    copy(acknowledgement, record, "actualRuntimeState");
+    acknowledgement.put("receptionPurpose", record.path("receptionPurpose").asText("ROUTINE"));
+    acknowledgement.putArray("blockers");
+    acknowledgement.put("acknowledgedAt", clock.instant().toString());
+    return acknowledgement;
+  }
+
+  private boolean activeRuntimeMatchesConfiguration(ObjectNode record) {
+    JsonNode active = record.path("activeRuntimeRef");
+    return (
+      active.isObject() &&
+      active.path("receptionPurpose").asText("ROUTINE").equals(record.path("receptionPurpose").asText("ROUTINE")) &&
+      samePin(active.path("profileRef"), record.path("profileRef")) &&
+      active.path("configRevision").asInt() == record.path("configRevision").asInt() &&
+      active.path("configFingerprint").asText().equals(record.path("configFingerprint").asText())
+    );
+  }
+
+  private String runtimeFingerprint(ObjectNode record, String state, int runtimeRevision) {
+    ObjectNode materialization = objectMapper.createObjectNode();
+    materialization.put("connectionId", record.path("connectionId").asText());
+    materialization.set("profileRef", record.path("profileRef").deepCopy());
+    materialization.put("configRevision", record.path("configRevision").asInt());
+    materialization.put("configFingerprint", record.path("configFingerprint").asText());
+    materialization.put("state", state);
+    materialization.put("receptionPurpose", record.path("receptionPurpose").asText("ROUTINE"));
+    materialization.put("runtimeRevision", runtimeRevision);
+    return fingerprints.canonicalFingerprint(materialization);
+  }
+
+  private void restoreActiveConnections() {
+    connections
+      .values()
+      .stream()
+      .filter(record -> "ACTIVE".equals(record.path("actualRuntimeState").asText()))
+      .sorted(Comparator.comparing(record -> record.path("connectionId").asText()))
+      .forEach(record -> {
+        try {
+          restore(record);
+        } catch (RuntimeException exception) {
+          // One connection that can no longer run must not stop every other analyzer from delivering.
+          String connectionId = record.path("connectionId").asText();
+          String reason = reasonOf(exception);
+          restoreFailures.put(connectionId, reason);
+          log.warn(
+            "Bridge connection {} did not restore; it stays inactive until activated again: {}",
+            connectionId,
+            reason
+          );
+        }
+      });
+  }
+
+  private void restore(ObjectNode record) {
+    ObjectNode restored = record.deepCopy();
+    JsonNode configuration = record.path("activeRuntimeConfiguration");
+    if (configuration.isObject() && record.path("activeRuntimeRef").isObject()) {
+      restored.set("values", configuration.path("values").deepCopy());
+      restored.set("displayName", configuration.path("displayName").deepCopy());
+      restored.put("receptionPurpose", configuration.path("receptionPurpose").asText("ROUTINE"));
+      ObjectNode active = (ObjectNode) record.path("activeRuntimeRef");
+      for (String key : List.of("profileRef", "configRevision", "configFingerprint")) {
+        restored.set(key, active.path(key).deepCopy());
+      }
+    } else if (!activeRuntimeMatchesConfiguration(record)) {
+      throw new AnalyzerConnectionException(
+        "Cannot restore active connection without its activated configuration: " + record.path("connectionId").asText()
+      );
+    }
+    ObjectNode profile = requirePinnedProfile((ObjectNode) restored.path("profileRef"));
+    runtime.restore(restored, profile.deepCopy());
+  }
+
+  /** The pin as the Bridge stores it: fields a newer client adds are not kept. */
+  private ObjectNode pinOf(ObjectNode supplied) {
+    ObjectNode pin = objectMapper.createObjectNode();
+    for (String key : List.of("profileId", "revision", "fingerprint")) {
+      if (supplied.has(key)) {
+        pin.set(key, supplied.path(key).deepCopy());
+      }
+    }
+    return pin;
+  }
+
+  private Optional<ObjectNode> pinnedProfile(ObjectNode record) {
+    try {
+      return Optional.of(requirePinnedProfile((ObjectNode) record.path("profileRef")));
+    } catch (AnalyzerConnectionException exception) {
+      return Optional.empty();
+    }
+  }
+
+  private static String reasonOf(RuntimeException exception) {
+    StringBuilder reason = new StringBuilder(String.valueOf(exception.getMessage()));
+    for (Throwable cause = exception.getCause(); cause != null; cause = cause.getCause()) {
+      reason.append(": ").append(cause.getMessage());
+    }
+    return reason.toString();
+  }
+
+  private ObjectNode runtimeConfiguration(ObjectNode record) {
+    ObjectNode configuration = objectMapper.createObjectNode();
+    configuration.set("values", record.path("values").deepCopy());
+    configuration.set("displayName", record.path("displayName").deepCopy());
+    configuration.put("receptionPurpose", record.path("receptionPurpose").asText("ROUTINE"));
+    return configuration;
+  }
+
+  private ObjectNode requireRecord(String connectionId) {
+    String setAsideReason = setAside.get(connectionId);
+    if (setAsideReason != null) {
+      throw new AnalyzerConnectionException(
+        Kind.CONFLICT,
+        "Saved Bridge connection " + connectionId + " cannot be read: " + setAsideReason
+      );
+    }
+    ObjectNode record = connections.get(connectionId);
+    if (record == null) {
+      throw new AnalyzerConnectionException(Kind.NOT_FOUND, "Unknown Bridge connection: " + connectionId);
+    }
+    return record;
+  }
+
+  /**
+   * A pin is the profile and its revision. The fingerprint a client sends with it is the content it
+   * last saw, so it is kept but never compared.
+   */
+  private ObjectNode pinIdentity(JsonNode profileRef) {
+    ObjectNode pin = objectMapper.createObjectNode();
+    pin.set("profileId", profileRef.path("profileId").deepCopy());
+    pin.set("revision", profileRef.path("revision").deepCopy());
+    return pin;
+  }
+
+  private boolean samePin(JsonNode left, JsonNode right) {
+    return pinIdentity(left).equals(pinIdentity(right));
+  }
+
+  /**
+   * The profile a pin names. A pin is a profile and a revision; whatever fingerprint it carries is
+   * the content its client last saw, and a file edited under the same revision is still the one it
+   * names.
+   */
+  private ObjectNode requirePinnedProfile(ObjectNode profileRef) {
+    String profileId = requireText(profileRef, "profileId");
+    int revision = requirePositiveInteger(profileRef, "revision");
+    try {
+      return profiles.require(profileId, revision).profile();
+    } catch (RuntimeException exception) {
+      throw new AnalyzerConnectionException("Unknown pinned profile revision " + profileId + "@" + revision, exception);
+    }
+  }
+
+  private ObjectNode effectiveValues(ObjectNode profile, ObjectNode suppliedValues) {
+    return effectiveValues(profile, suppliedValues, null);
+  }
+
+  private ObjectNode effectiveValues(ObjectNode profile, ObjectNode suppliedValues, ObjectNode existingValues) {
+    ObjectNode values = profileDefaults(profile);
+    if (existingValues != null) {
+      for (JsonNode descriptor : connectionFields(profile)) {
+        String key = descriptor.path("key").asText();
+        if (!suppliedValues.has(key) && existingValues.has(key)) {
+          values.set(key, existingValues.path(key).deepCopy());
+        }
+      }
+      if (!suppliedValues.has(CODE_OVERRIDES) && existingValues.has(CODE_OVERRIDES)) {
+        values.set(CODE_OVERRIDES, existingValues.path(CODE_OVERRIDES).deepCopy());
+      }
+    }
+    suppliedValues.fields().forEachRemaining(entry -> values.set(entry.getKey(), entry.getValue().deepCopy()));
+    if (
+      existingValues != null &&
+      "SERVER".equals(existingValues.path("connectionRole").asText()) &&
+      "CLIENT".equals(values.path("connectionRole").asText()) &&
+      !suppliedValues.has("port")
+    ) {
+      values.remove("port");
+    }
+    // A SERVER connection joins the shared listener; a port kept from the per-analyzer setup is dropped,
+    // as is one the profile no longer declares.
+    if ("SERVER".equals(values.path("connectionRole").asText()) || !fieldDescriptors(profile).containsKey("port")) {
+      values.remove("port");
+    }
+    return values;
+  }
+
+  private ObjectNode profileDefaults(ObjectNode profile) {
+    ObjectNode values = objectMapper.createObjectNode();
+    JsonNode defaults = profile.path("configDefaults");
+    if (defaults.isObject()) {
+      defaults.fields().forEachRemaining(entry -> values.set(entry.getKey(), entry.getValue().deepCopy()));
+    }
+    if ("SERVER".equals(values.path("connectionRole").asText())) values.remove("port");
+    return values;
+  }
+
+  private boolean sameConfiguration(ObjectNode record, ObjectNode profileRef, String displayName, ObjectNode values) {
+    return (
+      samePin(record.path("profileRef"), profileRef) &&
+      displayName.equals(record.path("displayName").asText()) &&
+      record.path("values").equals(values)
+    );
+  }
+
+  private String configurationFingerprint(ObjectNode profileRef, String displayName, ObjectNode values) {
+    ObjectNode configuration = objectMapper.createObjectNode();
+    configuration.set("profileRef", pinIdentity(profileRef));
+    configuration.put("displayName", displayName);
+    configuration.set("values", values.deepCopy());
+    return fingerprints.canonicalFingerprint(configuration);
+  }
+
+  private ObjectNode view(ObjectNode record, ObjectNode profile) {
+    ObjectNode response = objectMapper.createObjectNode();
+    response.put("schemaVersion", SCHEMA_VERSION);
+    copy(response, record, "connectionId");
+    copy(response, record, "clientAnalyzerId");
+    copy(response, record, "displayName");
+    response.set("profileRef", record.path("profileRef").deepCopy());
+    copy(response, record, "configRevision");
+    copy(response, record, "configFingerprint");
+    response.set("fields", profile == null ? objectMapper.createArrayNode() : fields(record, profile));
+    if (record.path("values").has(CODE_OVERRIDES)) {
+      response.set(CODE_OVERRIDES, record.path("values").path(CODE_OVERRIDES).deepCopy());
+    }
+    String connectionId = record.path("connectionId").asText();
+    String restoreFailure = restoreFailures.get(connectionId);
+    ArrayList<String> missingFields = profile == null ? new ArrayList<>() : missingRequiredFields(record, profile);
+    ObjectNode readiness = response.putObject("readiness");
+    readiness.put("ready", profile != null && missingFields.isEmpty() && restoreFailure == null);
+    ArrayNode blockers = readiness.putArray("blockers");
+    if (profile == null) {
+      ObjectNode blocker = blockers.addObject();
+      blocker.put("key", "profile-unavailable");
+      blocker.put("messageKey", "analyzer.connection.readiness.profileUnavailable");
+      blocker.putArray("fieldKeys");
+      JsonNode profileRef = record.path("profileRef");
+      blocker.put(
+        "detail",
+        profileRef.path("profileId").asText() +
+        "@" +
+        profileRef.path("revision").asInt() +
+        " is not in this Bridge's profile catalog with the pinned fingerprint"
+      );
+    }
+    if (restoreFailure != null) {
+      ObjectNode blocker = blockers.addObject();
+      blocker.put("key", "runtime-restore-failed");
+      blocker.put("messageKey", "analyzer.connection.readiness.restoreFailed");
+      blocker.putArray("fieldKeys");
+      blocker.put("detail", restoreFailure);
+    }
+    if (!missingFields.isEmpty()) {
+      ObjectNode blocker = blockers.addObject();
+      blocker.put("key", "missing-required-values");
+      blocker.put("messageKey", "analyzer.connection.readiness.missingRequiredValues");
+      ArrayNode fieldKeys = blocker.putArray("fieldKeys");
+      missingFields.forEach(fieldKeys::add);
+    }
+    response.set("latestProbe", record.path("latestProbe").deepCopy());
+    copy(response, record, "desiredRuntimeState");
+    if (restoreFailure != null) {
+      response.put("actualRuntimeState", "ERROR");
+    } else {
+      copy(response, record, "actualRuntimeState");
+    }
+    response.set("activeRuntimeRef", record.path("activeRuntimeRef").deepCopy());
+    response.put("receptionPurpose", record.path("receptionPurpose").asText("ROUTINE"));
+    copy(response, record, "updatedAt");
+    return response;
+  }
+
+  private ArrayNode fields(ObjectNode record, ObjectNode profile) {
+    ObjectNode values = (ObjectNode) record.path("values");
+    ObjectNode defaults = profileDefaults(profile);
+    Map<String, JsonNode> descriptors = fieldDescriptors(profile);
+    ArrayNode fields = objectMapper.createArrayNode();
+    for (JsonNode descriptor : connectionFields(profile)) {
+      String key = descriptor.path("key").asText();
+      boolean historicalIncomingPort = "port".equals(key) && "SERVER".equals(values.path("connectionRole").asText());
+      JsonNode currentValue = historicalIncomingPort ? objectMapper.missingNode() : values.path(key);
+      ObjectNode field = fields.addObject();
+      field.put("key", key);
+      field.put("labelKey", descriptor.path("labelKey").asText());
+      if (descriptor.has("helpTextKey")) {
+        field.set("helpTextKey", descriptor.path("helpTextKey").deepCopy());
+      }
+      String inputKind = descriptor.path("inputKind").asText();
+      field.put("inputKind", inputKind);
+      boolean required = descriptor.path("required").asBoolean();
+      field.put("required", required);
+      if ("SECRET".equals(inputKind)) {
+        field.putNull("defaultValue");
+        field.put("isSet", hasValue(currentValue));
+        field.put("maskedValue", "********");
+      } else {
+        field.set("defaultValue", defaults.has(key) ? defaults.path(key).deepCopy() : objectMapper.nullNode());
+      }
+      if (!"SECRET".equals(inputKind) && !currentValue.isMissingNode()) {
+        field.set("currentValue", currentValue.deepCopy());
+      }
+      field.set("choices", descriptor.path("choices").deepCopy());
+      if (descriptor.has("visibleWhen")) {
+        field.set("visibleWhen", descriptor.path("visibleWhen").deepCopy());
+      }
+      ArrayNode validationErrors = field.putArray("validationErrors");
+      if (required && isVisible(descriptor, values, descriptors) && !hasValue(currentValue)) {
+        validationErrors.add("analyzer.connection.validation.required");
+      }
+    }
+    return fields;
+  }
+
+  private ArrayList<String> missingRequiredFields(ObjectNode record, ObjectNode profile) {
+    ObjectNode values = (ObjectNode) record.path("values");
+    Map<String, JsonNode> descriptors = fieldDescriptors(profile);
+    ArrayList<String> missing = new ArrayList<>();
+    for (JsonNode descriptor : connectionFields(profile)) {
+      String key = descriptor.path("key").asText();
+      if (
+        descriptor.path("required").asBoolean() &&
+        isVisible(descriptor, values, descriptors) &&
+        !hasValue(values.path(key))
+      ) {
+        missing.add(key);
+      }
+    }
+    missing.sort(Comparator.naturalOrder());
+    return missing;
+  }
+
+  private static boolean hasValue(JsonNode value) {
+    return !value.isMissingNode() && !value.isNull() && (!value.isTextual() || !value.asText().isBlank());
+  }
+
+  private static boolean isVisible(JsonNode descriptor, ObjectNode values, Map<String, JsonNode> descriptors) {
+    return isVisible(descriptor, values, descriptors, new HashSet<>());
+  }
+
+  private static boolean isVisible(
+    JsonNode descriptor,
+    ObjectNode values,
+    Map<String, JsonNode> descriptors,
+    Set<String> visiting
+  ) {
+    String key = descriptor.path("key").asText();
+    if (!visiting.add(key)) {
+      return false;
+    }
+    try {
+      JsonNode condition = descriptor.path("visibleWhen");
+      if (!condition.isObject()) {
+        return true;
+      }
+      String controllingKey = condition.path("fieldKey").asText();
+      JsonNode controllingField = descriptors.get(controllingKey);
+      if (controllingField != null && !isVisible(controllingField, values, descriptors, visiting)) {
+        return false;
+      }
+      JsonNode actual = values.path(controllingKey);
+      JsonNode expected = condition.path("value");
+      return switch (condition.path("operator").asText()) {
+        case "EQUALS" -> actual.equals(expected);
+        case "NOT_EQUALS" -> !actual.equals(expected);
+        case "IN" -> expected.isArray() && contains(expected, actual);
+        case "NOT_IN" -> expected.isArray() && !contains(expected, actual);
+        default -> false;
+      };
+    } finally {
+      visiting.remove(key);
+    }
+  }
+
+  private static boolean contains(JsonNode values, JsonNode sought) {
+    for (JsonNode value : values) {
+      if (value.equals(sought)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static void validateHttpSender(ObjectNode values) {
+    String host = values.path("host").asText("");
+    if (
+      "HTTP".equals(values.path("transport").asText()) &&
+      !host.isBlank() &&
+      org.itech.ahb.util.IpLiteral.canonicalize(host) == null
+    ) {
+      throw new AnalyzerConnectionException("HTTP analyzer host must be a literal IP address");
+    }
+  }
+
+  /** A connection value every profile accepts: profile test code to the code this instrument sends. */
+  static final String CODE_OVERRIDES = "codeOverrides";
+
+  private void validateValues(ObjectNode profile, ObjectNode values) {
+    Map<String, JsonNode> descriptors = fieldDescriptors(profile);
+    Iterator<String> keys = values.fieldNames();
+    while (keys.hasNext()) {
+      String key = keys.next();
+      if (key.isBlank()) {
+        throw new AnalyzerConnectionException("Connection value keys must not be blank");
+      }
+      if (CODE_OVERRIDES.equals(key)) {
+        // The codes this instrument uses for the profile's assays; the runtime checks each
+        // against the pinned profile when the connection is applied.
+        BridgeAnalyzerConnectionRuntime.codeOverrides(profile, values);
+        continue;
+      }
+      JsonNode descriptor = descriptors.get(key);
+      if (descriptor == null && "port".equals(key)) {
+        // A port kept from the per-analyzer listener setup by a client or a migration; it is
+        // dropped with the other values the profile does not declare.
+        continue;
+      }
+      if (descriptor == null) {
+        throw new AnalyzerConnectionException("Connection value is not declared by the pinned profile: " + key);
+      }
+      if (values.path(key).isNull()) {
+        throw new AnalyzerConnectionException("Connection value must not be null: " + key);
+      }
+      validateValueType(key, descriptor, values.path(key));
+      if (
+        ("port".equals(key) || "outboundPort".equals(key)) &&
+        ("ASTM".equals(profile.path("protocol").path("name").asText()) ||
+          "HL7".equals(profile.path("protocol").path("name").asText()))
+      ) {
+        JsonNode port = values.path(key);
+        if (!port.isIntegralNumber() || !port.canConvertToInt() || port.intValue() < 1 || port.intValue() > 65535) {
+          throw new AnalyzerConnectionException(key + " must be an integer between 1 and 65535");
+        }
+      }
+    }
+  }
+
+  /** Historical socket port fields no longer configure a per-analyzer inbound listener. */
+  private static JsonNode connectionFields(ObjectNode profile) {
+    JsonNode declared = profile.path("connectionFields");
+    String protocol = profile.path("protocol").path("name").asText();
+    if (!"ASTM".equals(protocol) && !"HL7".equals(protocol)) return declared;
+    JsonNode projected = declared.deepCopy();
+    projected.forEach(field -> {
+      String key = field.path("key").asText();
+      if ("port".equals(key) || "outboundPort".equals(key)) ((ObjectNode) field).put("required", false);
+      if ("port".equals(key)) {
+        ((ObjectNode) field).putObject("visibleWhen")
+          .put("fieldKey", "connectionRole")
+          .put("operator", "EQUALS")
+          .put("value", "CLIENT");
+      }
+    });
+    return projected;
+  }
+
+  private static Map<String, JsonNode> fieldDescriptors(ObjectNode profile) {
+    Map<String, JsonNode> descriptors = new HashMap<>();
+    connectionFields(profile).forEach(field -> descriptors.put(field.path("key").asText(), field));
+    return descriptors;
+  }
+
+  private static void validateValueType(String key, JsonNode descriptor, JsonNode value) {
+    boolean correctType =
+      switch (descriptor.path("inputKind").asText()) {
+        case "NUMBER" -> value.isNumber();
+        case "BOOLEAN" -> value.isBoolean();
+        case "TEXT", "SECRET", "FILE_PATH", "SELECT" -> value.isTextual();
+        default -> false;
+      };
+    if (!correctType) {
+      throw new AnalyzerConnectionException("Connection value has the wrong type for " + key);
+    }
+    if (
+      "SELECT".equals(descriptor.path("inputKind").asText()) &&
+      descriptor.path("choices").findValues("value").stream().noneMatch(value::equals)
+    ) {
+      throw new AnalyzerConnectionException("Connection value is not an allowed choice for " + key);
+    }
+  }
+
+  private void load() {
+    if (!Files.exists(directory)) {
+      return;
+    }
+    try (Stream<Path> files = Files.list(directory)) {
+      files
+        .filter(Files::isRegularFile)
+        .filter(path -> path.getFileName().toString().endsWith(".json"))
+        .sorted()
+        .forEach(this::load);
+    } catch (IOException exception) {
+      throw new AnalyzerConnectionException("Cannot scan Bridge connections " + directory, exception);
+    }
+  }
+
+  private void load(Path path) {
+    String fileName = path.getFileName().toString();
+    String connectionId = fileName.substring(0, fileName.length() - ".json".length());
+    try {
+      add(read(path));
+    } catch (RuntimeException exception) {
+      String reason = reasonOf(exception);
+      setAside.put(connectionId, reason);
+      log.warn("Saved Bridge connection {} was set aside: {}", connectionId, reason);
+    }
+  }
+
+  private ObjectNode read(Path path) {
+    try {
+      JsonNode value = objectMapper.readTree(path.toFile());
+      if (!(value instanceof ObjectNode object)) {
+        throw new AnalyzerConnectionException("Persisted Bridge connection must be an object: " + path);
+      }
+      requireText(object, "connectionId");
+      requireText(object, "clientAnalyzerId");
+      requireObject(object, "profileRef");
+      requirePositiveInteger(object, "configRevision");
+      requireObject(object, "values");
+      return object;
+    } catch (IOException exception) {
+      throw new AnalyzerConnectionException("Cannot read persisted Bridge connection " + path, exception);
+    }
+  }
+
+  private void add(ObjectNode record) {
+    String connectionId = record.path("connectionId").asText();
+    String clientAnalyzerId = record.path("clientAnalyzerId").asText();
+    String prior = connectionIdByClientAnalyzerId.put(clientAnalyzerId, connectionId);
+    if (prior != null && !prior.equals(connectionId)) {
+      throw new AnalyzerConnectionException("Duplicate OpenELIS analyzer connection: " + clientAnalyzerId);
+    }
+    connections.put(connectionId, record.deepCopy());
+  }
+
+  private void persist(ObjectNode record) {
+    String connectionId = record.path("connectionId").asText();
+    UUID.fromString(connectionId);
+    Path target = directory.resolve(connectionId + ".json").normalize();
+    if (!target.getParent().equals(directory)) {
+      throw new AnalyzerConnectionException("Connection ID does not resolve inside the connection directory");
+    }
+    Path temporary = directory.resolve("." + connectionId + "." + UUID.randomUUID() + ".tmp");
+    try {
+      Files.createDirectories(directory);
+      Files.write(temporary, objectMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(record));
+      try {
+        Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+      } catch (AtomicMoveNotSupportedException exception) {
+        Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+      }
+    } catch (IOException exception) {
+      try {
+        Files.deleteIfExists(temporary);
+      } catch (IOException cleanupFailure) {
+        exception.addSuppressed(cleanupFailure);
+      }
+      throw new AnalyzerConnectionException("Cannot persist Bridge connection " + connectionId, exception);
+    }
+  }
+
+  private static void requireVersion(ObjectNode request) {
+    if (!SCHEMA_VERSION.equals(request.path("schemaVersion").asText())) {
+      throw new AnalyzerConnectionException("schemaVersion must be " + SCHEMA_VERSION);
+    }
+  }
+
+  private static String requireText(JsonNode object, String field) {
+    JsonNode value = object.path(field);
+    if (!value.isTextual() || value.asText().isBlank()) {
+      throw new AnalyzerConnectionException(field + " is required");
+    }
+    return value.asText();
+  }
+
+  private static int requirePositiveInteger(JsonNode object, String field) {
+    JsonNode value = object.path(field);
+    if (!value.isIntegralNumber() || value.asInt() < 1) {
+      throw new AnalyzerConnectionException(field + " must be a positive integer");
+    }
+    return value.asInt();
+  }
+
+  private static ObjectNode requireObject(JsonNode object, String field) {
+    JsonNode value = object.path(field);
+    if (!(value instanceof ObjectNode child)) {
+      throw new AnalyzerConnectionException(field + " must be an object");
+    }
+    return child;
+  }
+
+  private static void copy(ObjectNode target, ObjectNode source, String field) {
+    target.set(field, source.path(field).deepCopy());
+  }
+}

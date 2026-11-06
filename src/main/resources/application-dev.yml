@@ -1,0 +1,22 @@
+server:
+  port: 8443
+  ssl:
+    enabled: true
+    key-store-type: PKCS12
+    key-store: /etc/openelis-global/keystore
+    key-store-password: kspass
+management:
+  endpoint:
+    health:
+      show-details: when-authorized
+
+# File watcher — faster polling for dev/CI (files are written atomically).
+# Production keeps FileConfig.java defaults (5000ms poll, 3000ms stability).
+bridge:
+  file:
+    poll-interval-ms: 1000
+    file-stability-timeout-ms: 500
+
+# Run HL7 MLLP: the shared listener (org.itech.ahb.mllp.port, default 2575) is bound at boot.
+org.itech.ahb.mllp:
+  enabled: true

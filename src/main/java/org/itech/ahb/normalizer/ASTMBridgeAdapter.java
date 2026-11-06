@@ -1,0 +1,187 @@
+package org.itech.ahb.normalizer;
+
+import java.time.LocalDateTime;
+import java.util.Optional;
+import lombok.extern.slf4j.Slf4j;
+import org.itech.ahb.lib.astm.concept.ASTMMessage;
+import org.itech.ahb.lib.astm.concept.DefaultASTMMessage;
+import org.itech.ahb.lib.astm.handling.ASTMHandler;
+import org.itech.ahb.lib.astm.handling.ASTMHandlerResponse;
+import org.itech.ahb.lib.common.handling.HandleStatus;
+import org.itech.ahb.model.Protocol;
+import org.itech.ahb.model.Transport;
+
+/**
+ * ASTM bridge adapter that implements the ASTM library's {@link ASTMHandler} interface
+ * and delegates to {@link MessageNormalizer} for routing to OpenELIS.
+ * <p>
+ * All transport listeners, including ASTM TCP, route through the normalizer for durable receipt,
+ * profile-driven parsing, normalized delivery, audit logging, and saved connection identification.
+ * </p>
+ * <p>
+ * <b>What SUCCESS means here:</b> the bridge is durably holding the result, not that OpenELIS has
+ * it. LIS1-A acknowledges each frame as it arrives, so by the time this adapter runs the analyzer's
+ * session is already over and there is nothing left to refuse. The only way a result survives an
+ * OpenELIS outage is for the bridge to have stored it first, which is what the normalizer does
+ * before this status is decided.
+ * </p>
+ * <p>
+ * The adapter:
+ * <ol>
+ *   <li>Receives ASTM messages from the ASTM servlet (TCP listener)</li>
+ *   <li>Creates a {@link MessageEnvelope} with Protocol.ASTM and Transport.TCP</li>
+ *   <li>Delegates to {@link MessageNormalizer} for routing to OpenELIS</li>
+ *   <li>Returns {@link ASTMHandlerResponse} with appropriate {@link HandleStatus}</li>
+ * </ol>
+ * </p>
+ * <p>
+ * This class adapts the ASTM listener library to the Bridge runtime.
+ * </p>
+ *
+ * @see MessageNormalizer
+ * @see MessageEnvelope
+ * @see ASTMHandler
+ */
+@Slf4j
+public class ASTMBridgeAdapter implements ASTMHandler {
+
+    private final MessageNormalizer normalizer;
+    private final String sourceBindingId;
+    private final Integer listenerPort;
+
+    /**
+     * Constructs a new ASTMBridgeAdapter.
+     *
+     * @param normalizer the message normalizer for routing
+     */
+    public ASTMBridgeAdapter(MessageNormalizer normalizer) {
+        this(normalizer, null, null);
+    }
+
+    /** Creates an adapter bound to one durable Bridge connection listener. */
+    public ASTMBridgeAdapter(MessageNormalizer normalizer, String sourceBindingId) {
+        this(normalizer, sourceBindingId, null);
+    }
+
+    /**
+     * Creates the adapter for a shared listener: messages carry the peer IP and this listener's
+     * port, and the registry resolves which connection on the port each one belongs to.
+     */
+    public ASTMBridgeAdapter(MessageNormalizer normalizer, int listenerPort) {
+        this(normalizer, null, listenerPort);
+    }
+
+    private ASTMBridgeAdapter(MessageNormalizer normalizer, String sourceBindingId, Integer listenerPort) {
+        this.normalizer = normalizer;
+        this.sourceBindingId = sourceBindingId;
+        this.listenerPort = listenerPort;
+    }
+
+    /**
+     * Returns the name of this handler for logging purposes.
+     *
+     * @return "ASTM Bridge Adapter"
+     */
+    @Override
+    public String getName() {
+        return "ASTM Bridge Adapter";
+    }
+
+    /**
+     * Handles an ASTM message by creating a MessageEnvelope and routing via the normalizer.
+     * <p>
+     * The adapter:
+     * <ul>
+     *   <li>Extracts the raw message string from {@link ASTMMessage}</li>
+     *   <li>Uses the provided sourceIp (or "unknown" if null)</li>
+     *   <li>Creates a MessageEnvelope with Protocol.ASTM and Transport.TCP</li>
+     *   <li>Delegates to {@link MessageNormalizer#process(MessageEnvelope)}</li>
+     *   <li>Returns SUCCESS or FORWARD_FAIL_ERROR status</li>
+     * </ul>
+     * </p>
+     *
+     * @param message the ASTM message from the TCP listener
+     * @param sourceIp the IP address of the analyzer (may be null)
+     * @return ASTMHandlerResponse with appropriate status
+     */
+    @Override
+    public ASTMHandlerResponse handle(ASTMMessage message, String sourceIp) {
+        log.debug("ASTMBridgeAdapter handling message from {}", sourceIp);
+
+        String rawMessage = message.getMessage();
+        if (rawMessage == null || rawMessage.isBlank()) {
+            log.debug("ASTM session from {} completed without a result payload", sourceIp);
+            return new ASTMHandlerResponse("", HandleStatus.SUCCESS, false, this);
+        }
+
+        // Extract sender identifier from ASTM H-record field 4 (e.g., "GENEXPERT^GeneXpert^4.6.0")
+        String analyzerId = extractSenderFromHRecord(rawMessage);
+
+        // Create MessageEnvelope
+        MessageEnvelope envelope = MessageEnvelope.builder()
+            .protocol(Protocol.ASTM)
+            .transport(Transport.TCP)
+            .sourceId(sourceBindingId != null && !sourceBindingId.isBlank()
+                ? sourceBindingId
+                : sourceIp != null ? sourceIp : "unknown")
+            .listenerPort(listenerPort)
+            .rawMessage(rawMessage)
+            .protocolAnalyzerHint(analyzerId)
+            .build();
+
+        // Route via normalizer
+        boolean success = normalizer.process(envelope);
+
+        HandleStatus status = success ? HandleStatus.SUCCESS : HandleStatus.FORWARD_FAIL_ERROR;
+        Optional<String> reply = success && MessageNormalizer.isQueryOnlyAstmMessage(rawMessage)
+            ? AstmHostQuery.noOrdersReply(rawMessage, LocalDateTime.now())
+            : Optional.empty();
+
+        // The library sends a reply on the instrument's connection; everything else gets none.
+        return new ASTMHandlerResponse(reply.orElse(""), status, reply.isPresent(), this);
+    }
+
+    /**
+     * Checks if this handler matches the given ASTM message.
+     * <p>
+     * This adapter matches all {@link DefaultASTMMessage} instances (the standard ASTM message type).
+     * </p>
+     *
+     * @param message the ASTM message to check
+     * @return true if message is a DefaultASTMMessage, false otherwise
+     */
+    /**
+     * Extract sender identification from ASTM H-record field 4 — full string.
+     *
+     * <p>H-record format: {@code H|\^&|msgId|senderInfo|...} where senderInfo
+     * may be a single token ({@code "MINDRAY"}) or a {@code ^}-delimited
+     * tuple ({@code "LA2M3^GeneXpert^6.2"} = site^model^version per
+     * Cepheid LIS protocol spec).
+     *
+     * <p>Returns the full field-4 value as protocol evidence. The listener's
+     * saved Bridge connection remains routing authority; this value may
+     * corroborate that connection and is retained in normalized audit context.
+     */
+    public static String extractSenderFromHRecord(String rawMessage) {
+        if (rawMessage == null) return null;
+        for (String record : rawMessage.split("\r\n|\r|\n")) {
+            String line = record.trim();
+            if (line.length() > 1 && line.charAt(0) == 'H' && !Character.isLetterOrDigit(line.charAt(1))) {
+                String[] fields = line.split(java.util.regex.Pattern.quote(line.substring(1, 2)), -1);
+                if (fields.length > 4 && fields[4] != null && !fields[4].isBlank()) {
+                    String sender = fields[4].trim();
+                    if (!sender.isEmpty()) {
+                        log.debug("Extracted ASTM sender identifier (full): {}", sender);
+                        return sender;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public boolean matches(ASTMMessage message) {
+        return message instanceof DefaultASTMMessage;
+    }
+}

@@ -1,0 +1,86 @@
+# Test configuration for E2E Docker testing
+# WireMock (service "wiremock", port 8080 on the test network) acts as OpenELIS capture server
+
+bridge:
+  security:
+    enabled: true
+    username: bridge
+    password: changeme
+
+  profile-catalog:
+    directory: /data/openelis-analyzer-bridge/profile-catalog
+    shipped-pattern: classpath*:/analyzer-profiles/**/*.json
+
+  connection-catalog:
+    directory: /data/openelis-analyzer-bridge/connections
+
+  # Fast schedule so a scenario can watch a delivery fail, retry and recover without waiting out
+  # production backoff. maxAttempts is overridable per scenario: the dead-message-queue test needs
+  # the budget to run out, the others need it not to.
+  outbox:
+    pollInterval: 500ms
+    lease: 30s
+    retry:
+      maxAttempts: ${OUTBOX_MAX_ATTEMPTS:150}
+      baseDelay: 1s
+      multiplier: 2
+      maxDelay: 3s
+      jitter: 0
+
+  file:
+    enabled: true
+    pollIntervalMs: 2000
+    fileStabilityTimeoutMs: 2000
+    maxRetryAttempts: 2
+    retryDelayMs: 500
+    maxRetryDelayMs: 5000
+
+org:
+  itech:
+    ahb:
+      forward-http-server:
+        # By hostname, not by address: stopping the container removes the name from Docker's
+        # embedded DNS, which is how a scenario reproduces the DNS failure that lost results in
+        # production. An IP literal would only ever produce a refused connection.
+        uri: http://wiremock:8080/api/OpenELIS-Global
+        connectTimeoutSeconds: 5
+        readTimeoutSeconds: 5
+
+      listen-astm-server:
+        port: 12001
+        establishment-timeout-seconds: 15
+        receive-timeout-seconds: 30
+
+        e1381-95:
+          port: 12011
+
+      mllp:
+        enabled: true
+
+server:
+  port: 8443
+
+logging:
+  level:
+    root: INFO
+    org.itech: DEBUG
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  health:
+    mllp:
+      enabled: false
+    serial:
+      enabled: true
+    filewatcher:
+      enabled: true
+    httpforward:
+      enabled: true
+    outbox:
+      enabled: true

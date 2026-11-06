@@ -1,0 +1,38 @@
+x-logging: &local-logging
+  driver: "local"
+  options:
+    max-size: "20m"
+    max-file: "50"
+
+services:
+  openelis-analyzer-bridge:
+    container_name: openelis-analyzer-bridge
+    image: itechuw/openelis-analyzer-bridge:latest
+    pull_policy: always
+    ports:
+      - "8442:8443"     # HTTPS API endpoint
+      - "12000:12001"   # Shared ASTM LIS1-A listener
+      - "12010:12011"   # Shared ASTM E1381-95 listener
+      - "2575:2575"     # Shared HL7 MLLP listener (when org.itech.ahb.mllp.enabled)
+    volumes:
+      - ./configuration.yml:/app/configuration.yml
+      - bridge-data:/data/openelis-analyzer-bridge
+      # File watcher directories (uncomment if bridge.file.enabled=true)
+      # - /path/to/analyzer-import:/data/analyzer-imports:ro
+    # Serial device passthrough for active RS-232 analyzer connections.
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    environment:
+      LOGGING_LEVEL_ORG_ITECH: INFO
+      # Pair OpenELIS with this code; without it the Bridge logs a generated one at each start.
+      # BRIDGE_PAIRING_CODE: ${BRIDGE_PAIRING_CODE}
+    logging: *local-logging
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      timeout: 10s
+      interval: 30s
+      retries: 3
+      start_period: 2m
+
+volumes:
+  bridge-data:
